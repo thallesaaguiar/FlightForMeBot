@@ -1,0 +1,4 @@
+.env
+flights.db
+__pycache__/
+data/
