@@ -74,6 +74,17 @@ CASES = [
     ("e em dezembro?", EUROPE, {"destination_region": "europe", "_explore": True, "origin_code": "MAD",
                                 "depart_from": "2026-12-01", "depart_to": "2026-12-31"}),
     ("pode ser Roma", EUROPE, {"destination_code": "ROM", "_explore": False, "origin_code": "MAD", "min_days": 10}),
+    # a country as destination, a 6-month window, airline preference, budget with separate tickets
+    ("Quais são as melhores datas para viajar para o japao saindo de Madrid, viagem a partir de Abril até setembro de "
+     "2027? Quero ficar pelo menos 15 dias no Japão",
+     None, {"origin_code": "MAD", "_explore": True, "destination_region": "country:JP", "depart_from": "2027-04-01",
+            "depart_to": "2027-09-30", "min_days": 15}),
+    ("Consegue pesquisar voo mais baratos? AirChina estava ficando bem barato", MADRID,
+     {"origin_code": "MAD", "destination_code": "TYO",
+      "airlines": lambda v: bool(v) and "airchina" in "".join(v).lower().replace(" ", "")}),
+    ("ajuste as datas para outras opcoes que fique mais baratos. Minha meta é pagar até uns R$3.600 por pessoa.\n\n"
+     "Faça buscas com ida e volta separadas", MADRID,
+     {"max_price": 3600.0, "separate_tickets": True, "destination_code": "TYO", "origin_code": "MAD"}),
     ("e qualquer lugar da Ásia?", MADRID, {"destination_region": "asia", "_explore": True, "origin_code": "MAD",
                                           "depart_from": "2027-04-01"}),
 ]
@@ -87,7 +98,8 @@ def main():
             q = llm.extract(text, dict(current) if current else None, TODAY)
             problem = search.validate(q, TODAY)
             got = {**q, "_asks": bool(problem)}
-            bad = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
+            ok = lambda k, v: v(got.get(k)) if callable(v) else got.get(k) == v
+            bad = {k: (got.get(k), "check" if callable(v) else v) for k, v in want.items() if not ok(k, v)}
             if problem and not want.get("_asks"):
                 bad["validate"] = problem
         except Exception as e:

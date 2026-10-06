@@ -28,6 +28,10 @@ if (ROOT / ".env").exists():
 CURRENCY = os.environ.get("CURRENCY", "BRL")
 SERP_MONTHLY_CAP = int(os.environ.get("SERPAPI_MONTHLY_CAP", "250"))
 CACHE_TTL = 6 * 3600
+SEATS_KEY = os.environ.get("SEATS_AERO_KEY")  # unset = award (miles/points) search off
+CABINS = {"economy": "Y", "premium": "W", "business": "J", "first": "F"}
+PROGRAMS = ("smiles azul flyingblue aeroplan united american delta emirates etihad qatar turkish lufthansa singapore "
+            "virginatlantic alaska qantas velocity jetblue connectmiles ethiopian saudia finnair eurobonus aeromexico").split()
 # ponytail: static hub list tuned for Brazil <-> Europe/Americas; pass hubs= for other regions
 DEFAULT_HUBS = ["LIS", "OPO", "MAD", "BCN", "CDG", "AMS", "FRA", "FCO", "LHR", "MIA", "JFK", "PTY", "BOG", "SCL", "EZE"]
 
@@ -283,6 +287,53 @@ def booking_options(origin: str, destination: str, date: str, return_date: str |
             "paid_searches_this_month": _month_calls()}
 
 
+def parse_awards(data: list[dict], cabin: str) -> list[dict]:
+    """Seats.aero availability objects -> bookable award seats in one cabin, fewest miles first."""
+    c = CABINS[cabin]
+    out = []
+    for a in data:
+        try:
+            miles = int(a.get(f"{c}MileageCost") or 0)
+        except (TypeError, ValueError):
+            continue
+        if a.get(f"{c}Available") and miles > 0:
+            out.append({"date": a["Date"], "program": a["Source"], "miles": miles, "airlines": a.get(f"{c}Airlines") or "",
+                        "direct": bool(a.get(f"{c}Direct")), "seats": a.get(f"{c}RemainingSeats"),
+                        "from": a["Route"]["OriginAirport"], "to": a["Route"]["DestinationAirport"]})
+    return sorted(out, key=lambda x: x["miles"])
+
+
+def awards(origin: str, dest: str, start: str, end: str, cabin: str = "economy", programs: list[str] | None = None) -> list[dict]:
+    """Cached award availability (Seats.aero Pro: 1,000 calls/day, no SerpApi quota). [] when SEATS_AERO_KEY is unset.
+    ponytail: miles only; taxes need include_trips (per-flight data), add if people book from here"""
+    if not SEATS_KEY:
+        return []
+    params = {"origin_airport": origin, "destination_airport": dest, "start_date": start, "end_date": end,
+              "cabins": cabin, "order_by": "lowest_mileage", "take": 500,
+              **({"sources": ",".join(programs)} if programs else {})}
+
+    def fetch():
+        r = httpx.get("https://seats.aero/partnerapi/search", params=params,
+                      headers={"Partner-Authorization": SEATS_KEY}, timeout=30)
+        r.raise_for_status()
+        return r.json().get("data") or []
+
+    return parse_awards(_cached("seats:" + json.dumps(params, sort_keys=True), fetch), cabin)
+
+
+def award_search(origin: str, destination: str, date_from: str, date_to: str, cabin: str = "economy",
+                 programs: list[str] | None = None) -> dict:
+    """Award seats bought with miles/points (Seats.aero cache, no paid SerpApi search). IATA codes, comma-separated
+    for several airports; dates YYYY-MM-DD; cabin economy|premium|business|first; programs e.g. ["smiles","flyingblue"].
+    Miles are per person, one way, taxes not included."""
+    return {"options": awards(origin, destination, date_from, date_to, cabin, programs)[:15],
+            "note": "miles per person, one way, taxes not included"}
+
+
+if SEATS_KEY:  # the tool only exists for the models when the key is configured
+    mcp.tool()(award_search)
+
+
 @mcp.tool()
 def usage() -> dict:
     """Paid SerpApi searches used this month vs cap."""
@@ -301,6 +352,14 @@ def selftest():
             {"price": 80, "depart": "2026-11-12 18:00"}]   # 31h: too long
     s = best_splits(leg1, leg2, 3, 24)
     assert s[0]["price"] == 1020 and s[0]["connection_hours"] == 4.0, s
+    sample = [{"Date": "2027-04-12", "Source": "smiles", "Route": {"OriginAirport": "MAD", "DestinationAirport": "NRT"},
+               "YAvailable": True, "YMileageCost": "35000", "YAirlines": "AF", "YDirect": False, "YRemainingSeats": 4},
+              {"Date": "2027-04-13", "Source": "united", "Route": {"OriginAirport": "MAD", "DestinationAirport": "NRT"},
+               "YAvailable": False, "YMileageCost": "0"},
+              {"Date": "2027-04-14", "Source": "flyingblue", "Route": {"OriginAirport": "MAD", "DestinationAirport": "HND"},
+               "YAvailable": True, "YMileageCost": "30000", "YAirlines": "KL", "YDirect": False}]
+    got = parse_awards(sample, "economy")
+    assert [(a["program"], a["miles"]) for a in got] == [("flyingblue", 30000), ("smiles", 35000)], got
     print("selftest ok")
 
 

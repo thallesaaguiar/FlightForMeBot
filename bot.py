@@ -4,6 +4,7 @@
 # ///
 """Telegram front-end: alert commands (no LLM) + optional free-text chat with the flight agent (llm.py)."""
 import os
+import re
 import time
 
 import httpx
@@ -19,10 +20,15 @@ ALLOWED = {int(c) for c in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if 
 OPEN_SIGNUP = os.environ.get("OPEN_SIGNUP") == "1"   # anyone can use /alerta; LLM chat stays ALLOWED-only
 CHAT_LLM = os.environ.get("CHAT_LLM", "1") == "1" and bool(llm.ORDER)  # 0 = commands only, zero LLM spend
 CHECK_EVERY = 6 * 3600
-SESSION_TTL = int(os.environ.get("SESSION_MINUTES", "5")) * 60  # idle time before a chat starts from scratch
+# idle time before a chat forgets the search; a message naming a new route replaces it anyway
+SESSION_TTL = int(os.environ.get("SESSION_MINUTES", "60")) * 60
 CHAT_MODE = os.environ.get("CHAT_MODE", "buscar")  # what free text does outside a session: buscar | agente
 sessions: dict[int, dict] = {}   # chat -> {"mode": "buscar" | "agente", "q": last validated search or None}
 last_seen: dict[int, float] = {}
+DEEP = re.compile(r"data por data|dia a dia|dia por dia|todas as datas|todas as combina|cada data|varredura"
+                  r"|every date|day by day|all dates")
+MORE = re.compile(r"mais op|outras op|outras data|outras combina|mais combina|mais barat|outras busca|mais resultad"
+                  r"|more option|other date|cheaper|more result")
 LANG_CHOICES = [("🇧🇷 Português", "lang:pt"), ("🇬🇧 English", "lang:en")]
 
 
@@ -163,18 +169,24 @@ def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | No
             alerts.log_miss(chat, text, f"asked: {problem}")
             send(chat, problem)  # clarifying costs no quota
             return
+        deep = admin and bool(DEEP.search(search._norm(text)))  # 8 dates at once costs 8 searches: admins only
+        more = deep or bool(MORE.search(search._norm(text)))  # "mais opções", "outras datas", "mais barato"
         same = lambda d: {k: v for k, v in (d or {}).items() if not k.startswith("_") and not k.endswith("_text") and k != "missing"}
-        if s["q"] and same(q) == same(s["q"]):
+        if s["q"] and same(q) == same(s["q"]) and not more:
             alerts.log_miss(chat, text, "refinement changed nothing")
             send(chat, tr(lang, "Não entendi o que mudar nessa busca. Posso ajustar: datas ou mês, dias de viagem, escalas, "
-                                "duração máxima do voo (ex: \"até 19h de voo\"), orçamento, origem, destino ou região. "
-                                "Para uma busca nova, use /buscar.",
+                                "duração máxima do voo (ex: \"até 19h de voo\"), orçamento, companhia, origem, destino "
+                                "ou região. Para ver outras datas, mande \"mais opções\". Para uma busca nova, use /buscar.",
                           "I couldn't tell what to change in this search. I can adjust: dates or month, trip length, stops, "
-                          "maximum flight time (e.g. \"up to 19h per flight\"), budget, origin, destination or region. "
-                          "For a new search, use /buscar."))
+                          "maximum flight time (e.g. \"up to 19h per flight\"), budget, airline, origin, destination or "
+                          "region. For other dates, send \"more options\". For a new search, use /buscar."))
             return
         s["q"] = q
-        msg, links = search.run(q, lang)
+        tried = s.setdefault("tried", set())  # date pairs / destinations already checked live in this session
+        if not more:
+            tried.clear()
+        msg, links, checked = search.run(q, lang, frozenset(tried), search.DEEP if deep else search.LIVE)
+        tried.update(checked)
         alerts.count_busca(chat, name)
         send(chat, msg + tr(lang, "\n\nPode ajustar em texto (ex: \"e em junho?\", \"aceito 2 escalas\"). ",
                             "\n\nYou can refine it in text (e.g. \"what about June?\", \"2 stops is fine\"). ")

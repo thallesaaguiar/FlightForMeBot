@@ -158,7 +158,8 @@ EXTRACT_PROMPT = """Today is {today}. Turn the user's flight request into JSON, 
    (SAO, RIO, TYO, LON, PAR, NYC, MIL, ROM, MOW, CHI, WAS, BUE, STO, OSA, SEL, BJS), else the airport code,
  "origin_airports": comma-separated airport codes for the live search (e.g. "GRU,VCP,CGH" or "HND,NRT"),
  "destination_text": the exact words of THIS message that name the destination or region, or null,
- "destination_city": same as origin_city, "destination_code": same rule, "destination_airports": same rule,
+ "destination_city": same as origin_city; when the destination is a country, its English name (e.g. "Japan"),
+ "destination_code": same rule, "destination_airports": same rule,
  "depart_from": "YYYY-MM-DD", "depart_to": "YYYY-MM-DD": the window for the OUTBOUND flight only, never the return date
    (a month or month range covers whole months; a fixed outbound date means depart_from = depart_to;
    "from April onward" with no end means April 1 to the last day of May),
@@ -173,6 +174,8 @@ EXTRACT_PROMPT = """Today is {today}. Turn the user's flight request into JSON, 
    "oceania", "domestic" (same country as the origin) or "anywhere"; then the destination_* fields are null,
  "max_price": budget per person as a number, or null,
  "max_hours": longest acceptable duration of each flight in hours (e.g. "até 19h de voo" -> 19), or null,
+ "airlines": airline names the user prefers (e.g. ["Air China"]), or null,
+ "separate_tickets": true when the user wants the outbound and return priced as separate one-way tickets,
  "missing": "" or a short question in the user's language ONLY when the origin is unknown, or when there is neither
    a destination nor a region}}
 When the user gives no dates or wants the cheapest dates, leave depart_from and depart_to null: never ask for dates.
@@ -204,6 +207,13 @@ def _month_end(y: int, m: int) -> date:
     return date(y + m // 12, m % 12 + 1, 1) - timedelta(days=1)
 
 
+PROGRAM_WORDS = [(r"\bsmiles\b", "smiles"), (r"tudoazul|azul fidelidade|(milhas|pontos) (da )?azul", "azul"),
+                 (r"flying ?blue", "flyingblue"), (r"aeroplan", "aeroplan"), (r"mileageplus", "united"),
+                 (r"aadvantage", "american"), (r"skymiles", "delta"), (r"skywards", "emirates"),
+                 (r"etihad guest", "etihad"), (r"privilege club|avios do qatar", "qatar"), (r"miles ?(and|&) ?smiles", "turkish"),
+                 (r"miles ?(and|&) ?more", "lufthansa"), (r"krisflyer", "singapore"), (r"flying club", "virginatlantic")]
+CABIN_WORDS = [(r"primeira classe|first class", "first"), (r"executiva|business", "business"),
+               (r"premium economy|economica premium|premium", "premium")]
 REGION_WORDS = [("america do sul", "south_america"), ("south america", "south_america"), ("europa", "europe"),
                 ("europe", "europe"), ("asia", "asia"), ("oriente medio", "middle_east"), ("middle east", "middle_east"),
                 ("africa", "africa"), ("oceania", "oceania"), ("caribe", "north_america"), ("caribbean", "north_america"),
@@ -220,9 +230,36 @@ def named(q: dict, side: str, t: str) -> bool:
     return any(len(x) >= 3 and _norm(x) in t for x in (str(q.get(f"{side}_{k}") or "") for k in ("city", "code")))
 
 
+def real_place(q: dict, side: str) -> bool:
+    """A city or country that exists ("na verdade só ida" came back as an origin city name)."""
+    import search  # lazy: search is only needed here and imports nothing from this module
+    name = q.get(f"{side}_city")
+    return bool(search.resolve(name, q.get(f"{side}_code"), q.get(f"{side}_airports"))
+                or (side == "destination" and name and search._norm(str(name)) in search.countries()[0]))
+
+
 def _fill_from_text(q: dict, text: str, today: date):
     """Deterministic backup for what small models drop: regions, month names and lengths of stay in the message."""
     t = _norm(text)
+    if re.search(r"separad|dois trechos|duas passagens|passagens? (de )?so (de )?ida|separate tickets|two one.?way", t):
+        q["separate_tickets"] = True
+    # miles/points: read from the text only, set only when present so a refinement keeps the earlier choice
+    programs = [p for w, p in PROGRAM_WORDS if re.search(w, t)]
+    if programs:
+        q["award_programs"] = list(dict.fromkeys(programs))
+    if programs or re.search(r"\bmilhas\b|(com|usando|usar|em|de) pontos|award|resgat|\bmiles\b|with points", t):
+        q["points"] = True
+    cabin = next((c for w, c in CABIN_WORDS if re.search(w, t)), None)
+    if cabin:
+        q["cabin"] = cabin
+    squashed = t.replace(" ", "")
+    q["airlines"] = [a for a in q.get("airlines") or [] if a and _norm(str(a)).replace(" ", "") in squashed] or None
+    if not q["airlines"]:  # the model missed it: look for known airline names ("AirChina", "air china")
+        import search  # lazy, see real_place
+        found = [n for n in search.airline_names() if len(_norm(n).replace(" ", "")) >= 6
+                 and _norm(n).replace(" ", "") in squashed]
+        found += [n for n in ("LATAM", "TAP") if re.search(rf"\b{n.lower()}\b", t)]
+        q["airlines"] = found[:3] or None
     region = next((r for w, r in REGION_WORDS if re.search(rf"\b{w}\b", t)), None)
     if q.get("destination_region") and not region:
         q["destination_region"] = None  # a region the message never names is invented
@@ -287,14 +324,18 @@ def extract(text: str, current: dict | None = None, today: date | None = None) -
                     moved.add("destination")  # "e qualquer lugar da Ásia?": don't pull the old city back in
                 for side in list(moved):
                     # a place the message never mentions is the model copying an example (origin became Lisbon)
-                    if not named(q, side, _norm(text)) and not (side == "destination" and q.get("destination_region")):
+                    if (not (named(q, side, _norm(text)) and real_place(q, side))
+                            and not (side == "destination" and q.get("destination_region"))):
                         moved.discard(side)
-                        q.update({k: v for k, v in current.items() if k.startswith(side)})
+                        for f in ("text", "city", "code", "airports"):  # back to the previous place, junk included
+                            q[f"{side}_{f}"] = current.get(f"{side}_{f}")
                         if side == "destination":
                             q["destination_region"] = current.get("destination_region")
                 q.update({k: v for k, v in current.items()
-                          if not k.startswith("_") and k != "missing" and q.get(k) in (None, "")
+                          if not k.startswith("_") and k != "missing" and q.get(k) in (None, "", [])
                           and k.split("_")[0] not in moved})  # a new origin must not inherit the old city name
+                # ponytail: separate tickets stays on for the session once asked; /buscar starts clean
+                q["separate_tickets"] = bool(q.get("separate_tickets") or current.get("separate_tickets"))
                 t = _norm(text)
                 if not any(w in MONTHS for w in re.findall(r"[a-z]+", t)) and not re.search(r"\d{1,2}/\d{1,2}", t):
                     # no month or date in the message: dates can't have changed (the model copied the example's March)

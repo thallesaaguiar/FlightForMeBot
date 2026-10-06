@@ -9,6 +9,7 @@ import os
 import re
 import unicodedata
 from datetime import date, timedelta
+from difflib import SequenceMatcher
 
 import httpx
 
@@ -17,8 +18,12 @@ import server
 from alerts import money, tr
 
 LIVE = int(os.environ.get("BUSCAR_LIVE", "3"))  # paid searches per /buscar
+DEEP = int(os.environ.get("BUSCAR_DEEP", "8"))  # dates checked when an admin asks "data por data" / "todas as datas"
 DEFAULT_WINDOW = (13, 103)  # days after tomorrow searched when the user gives no dates (~2 weeks to ~3 months)
 MUCH_CHEAPER = 0.8  # a flight with more stops than asked is shown only if it costs <= 80% of the best allowed one
+MAX_WINDOW = 190  # departure window for searches (alerts keep their own, smaller one): "April to September" fits
+SEP_PAIRS = 2  # date pairs priced as two one-way tickets (3 paid searches each: round trip, outbound, return)
+SPREAD = (0, 0.5, 1, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875)  # evenly spaced dates when the cache runs out
 
 # "anywhere in Europe" requests: region -> ISO country codes. Fixed in code so the model can't invent a country.
 # ponytail: no themes (beach, ski); add a hand-picked city list per theme if people ask for it
@@ -76,6 +81,62 @@ def places():
     return _places
 
 
+_countries = None
+
+
+def countries() -> tuple[dict, dict]:
+    """(normalized English name -> ISO code, ISO code -> name) from Travelpayouts (free, cached in data/)."""
+    global _countries
+    if _countries is None:
+        f = server.ROOT / "data" / "countries.json"
+        if not f.exists():
+            f.parent.mkdir(exist_ok=True)
+            r = httpx.get("https://api.travelpayouts.com/data/en/countries.json", timeout=120)
+            r.raise_for_status()
+            f.write_bytes(r.content)
+        raw = json.loads(f.read_text())
+        _countries = ({_norm(n): c["code"] for c in raw for n in {c["name"], (c.get("name_translations") or {}).get("en")} - {None}},
+                      {c["code"]: c["name"] for c in raw})
+    return _countries
+
+
+_airlines = None
+
+
+def airline_names() -> list[str]:
+    """Airline names from Travelpayouts (free, cached in data/), for spotting a preferred airline in a message."""
+    global _airlines
+    if _airlines is None:
+        f = server.ROOT / "data" / "airlines.json"
+        if not f.exists():
+            f.parent.mkdir(exist_ok=True)
+            r = httpx.get("https://api.travelpayouts.com/data/en/airlines.json", timeout=120)
+            r.raise_for_status()
+            f.write_bytes(r.content)
+        _airlines = sorted({a["name"] for a in json.loads(f.read_text()) if a.get("name")})
+    return _airlines
+
+
+def region_name(region: str, lang: str | None) -> str:
+    if region.startswith("country:"):
+        return countries()[1].get(region[8:], region[8:])
+    return REGION_NAMES[region][lang == "en"]
+
+
+def allowed_countries(region: str, origin: str) -> set | None:
+    if region.startswith("country:"):
+        return {region[8:]}
+    if region == "domestic":
+        return {places()[1].get(origin, {}).get("country_code")}
+    return REGIONS[region]
+
+
+def airline_match(o: dict, q: dict) -> bool:
+    """Preferred airline by name ("Air China" ~ "AirChina")."""
+    want = [_norm(a).replace(" ", "") for a in q.get("airlines") or []]
+    return any(w and w in _norm(x).replace(" ", "") for w in want for x in o.get("airlines", []))
+
+
 def resolve(city: str | None, code_hint: str | None, airports_hint: str | None) -> tuple[str, str] | None:
     """(city code, airports for the live search) from the city NAME; the model's code only breaks ties.
     Models invent plausible codes (Porto -> POR, which is Pori in Finland), the name lookup doesn't."""
@@ -86,10 +147,12 @@ def resolve(city: str | None, code_hint: str | None, airports_hint: str | None) 
         c = (next((c for c in matches if c["code"] == hint), None)
              or next((c for c in matches if c.get("has_flightable_airport")), matches[0]))
         code = c["code"]
-    elif hint in cities:
-        code = hint
-    elif hint in airport_city:
-        code = airport_city[hint]
+    elif hint in cities or hint in airport_city:
+        code = hint if hint in cities else airport_city[hint]
+        given, real = _norm(str(city or "")), _norm(cities.get(code, {}).get("name", ""))
+        # a name that isn't a city plus an unrelated code ("Japan" + JPN, a Washington heliport) is a guess, not a place
+        if given and given not in real and real not in given and SequenceMatcher(None, given, real).ratio() < 0.5:
+            return None
     else:
         return None
     all_airports = city_airports.get(code) or [code]
@@ -102,11 +165,18 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
     tomorrow = (today or date.today()) + timedelta(days=1)
     region = str(q.get("destination_region") or "").lower().strip()
     # a named destination always wins over a region left over from an earlier "anywhere in Europe" search
-    q["_explore"] = region in REGIONS and not (q.get("destination_city") or q.get("destination_code"))
+    q["_explore"] = ((region in REGIONS or region.startswith("country:"))
+                     and not (q.get("destination_city") or q.get("destination_code")))
     for side in ("origin", "destination"):
         if side == "destination" and q["_explore"]:
             q["destination_region"] = region
             continue
+        if side == "destination":  # "para o Japão": a country is a region of one country (checked before cities)
+            names = [q.get("destination_city"), q.get("destination_text")]
+            iso = next((countries()[0][_norm(str(n))] for n in names if n and _norm(str(n)) in countries()[0]), None)
+            if iso:
+                q.update(_explore=True, destination_region=f"country:{iso}")
+                continue
         place = resolve(q.get(f"{side}_city"), q.get(f"{side}_code"), q.get(f"{side}_airports"))
         if not place:
             return q.get("missing") or tr(
@@ -123,6 +193,11 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
         q["max_hours"] = float(q["max_hours"]) if q.get("max_hours") and 1 <= float(q["max_hours"]) <= 60 else None
     except (TypeError, ValueError):
         q["max_hours"] = None
+    q["airlines"] = [str(a) for a in q.get("airlines") or [] if a][:3]
+    q["separate_tickets"] = bool(q.get("separate_tickets"))
+    q["points"] = bool(q.get("points"))
+    q["cabin"] = q.get("cabin") if q.get("cabin") in server.CABINS else "economy"
+    q["award_programs"] = [p for p in q.get("award_programs") or [] if p in server.PROGRAMS]
     q["missing"] = ""  # route is known: whatever the model wanted to ask is answered by the defaults below
     try:
         q["adults"] = max(1, min(9, int(q.get("adults") or 1)))
@@ -147,9 +222,9 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
     d0 = max(d0, tomorrow)
     if d1 < d0:
         return tr(lang, "As datas de ida já passaram ou estão invertidas.", "The departure dates are in the past or reversed.")
-    if (d1 - d0).days > alerts.MAX_WINDOW_DAYS:
-        return tr(lang, f"O período de ida pode ter no máximo {alerts.MAX_WINDOW_DAYS} dias.",
-                  f"The departure period can be at most {alerts.MAX_WINDOW_DAYS} days.")
+    if (d1 - d0).days > MAX_WINDOW:
+        return tr(lang, f"O período de ida pode ter no máximo {MAX_WINDOW} dias (uns 6 meses).",
+                  f"The departure period can be at most {MAX_WINDOW} days (about 6 months).")
     q["depart_from"], q["depart_to"] = d0.isoformat(), d1.isoformat()
     if q.get("round_trip"):
         try:
@@ -181,8 +256,13 @@ def _cached_fares(q: dict, a: dict, cs: list) -> list[dict]:
     return sorted(out, key=lambda c: c["price"])
 
 
-def candidates(q: dict) -> tuple[list[tuple], int]:
-    """Up to LIVE (departure, return) pairs at least 3 days apart, and how many cached fares were found."""
+def key(dep: str, ret: str | None) -> str:
+    return f"{dep}|{ret}"
+
+
+def candidates(q: dict, exclude=frozenset(), one_way_first: bool = False, n: int = LIVE) -> tuple[list[tuple], int]:
+    """Up to n (departure, return) pairs at least 3 days apart, skipping pairs already checked live,
+    and how many cached fares were found. one_way_first ranks by one-way fares (for separate tickets)."""
     rt = bool(q.get("round_trip"))
     d0, d1 = date.fromisoformat(q["depart_from"]), date.fromisoformat(q["depart_to"])
     a = {"origin": q["origin_code"], "dest": q["destination_code"], "dep_from": q["depart_from"], "dep_to": q["depart_to"],
@@ -197,19 +277,18 @@ def candidates(q: dict) -> tuple[list[tuple], int]:
 
     def add(pair):
         dep = date.fromisoformat(pair[0])
-        if pair in cs and all(abs((dep - date.fromisoformat(p[0])).days) >= 3 for p in picked):
+        if (pair in cs and key(*pair) not in exclude
+                and all(abs((dep - date.fromisoformat(p[0])).days) >= 3 for p in picked)):
             picked.append(pair)
 
-    for c in cached:
-        add((c["depart"], c["return"]))
-    for pair, est in alerts.scored(a, cs):
-        if est != float("inf"):
-            add(pair)
+    estimated = [pair for pair, est in alerts.scored(a, cs) if est != float("inf")]
+    for pair in (estimated if one_way_first else []) + [(c["depart"], c["return"]) for c in cached] + estimated:
+        add(pair)
     span = (d1 - d0).days
-    for f in (0, 0.5, 1):  # empty cache: sample the window evenly
+    for f in SPREAD:  # cache exhausted or empty: sample the window evenly
         dep = d0 + timedelta(days=round(span * f))
         add((dep.isoformat(), (dep + timedelta(days=q["min_days"])).isoformat() if rt else None))
-    return picked[:LIVE], len(cached)
+    return picked[:n], len(cached)
 
 
 def _fmt(d: str) -> str:
@@ -241,8 +320,7 @@ def explore_fares(q: dict) -> list[dict]:
     """Cheapest cached fare per destination from the origin, inside the region, window, stay, stops and budget."""
     _, cities, _, _ = places()
     origin, rt, ms, maxp = q["origin_code"], bool(q.get("round_trip")), q.get("max_stops"), q.get("max_price")
-    home = cities.get(origin, {}).get("country_code")
-    allowed = {home} if q["destination_region"] == "domestic" else REGIONS[q["destination_region"]]
+    allowed = allowed_countries(q["destination_region"], origin)
     d0, d1 = date.fromisoformat(q["depart_from"]), date.fromisoformat(q["depart_to"])
     dep_months = sorted({(d0 + timedelta(days=i)).isoformat()[:7] for i in range((d1 - d0).days + 1)})
     ret_months = sorted({(d0 + timedelta(days=i + q["min_days"])).isoformat()[:7]
@@ -269,10 +347,10 @@ def explore_fares(q: dict) -> list[dict]:
     return sorted(best.values(), key=lambda f: f["price"])
 
 
-def run_explore(q: dict, lang: str | None) -> tuple[str, list[dict]]:
+def run_explore(q: dict, lang: str | None, exclude=frozenset()) -> tuple[str, list[dict], list[str]]:
     """'Anywhere in Europe': rank destinations on the free cache, confirm the LIVE cheapest ones live."""
-    fares = explore_fares(q)
-    where = REGION_NAMES[q["destination_region"]][lang == "en"]
+    fares = [f for f in explore_fares(q) if f"dest:{f['dest']}" not in exclude]
+    where = region_name(q["destination_region"], lang)
     rt, ms = bool(q.get("round_trip")), q.get("max_stops")
     d0, d1 = _fmt(q["depart_from"]), _fmt(q["depart_to"])
     if not fares:
@@ -281,7 +359,7 @@ def run_explore(q: dict, lang: str | None) -> tuple[str, list[dict]]:
                         + ". Tente outro período, um orçamento maior ou diga um destino.",
                   f"I found no cached fares from {q['origin_airports']} to {where} between {d0} and {d1}"
                   + (f" under {money(q['max_price'])}" if q.get("max_price") else "")
-                  + ". Try another period, a bigger budget or name a destination."), []
+                  + ". Try another period, a bigger budget or name a destination."), [], []
     before = server._month_calls()
     confirmed = []
     for f in fares[:LIVE]:
@@ -292,7 +370,7 @@ def run_explore(q: dict, lang: str | None) -> tuple[str, list[dict]]:
     used = server._month_calls() - before
     live = sorted((c for c in confirmed if c["ok"]), key=lambda c: c["ok"]["price"])
     head = (tr(lang, f"Saindo de {q['origin_airports']} para {where}, ", f"From {q['origin_airports']} to {where}, ")
-            + (tr(lang, f"ida e volta, {q['min_days']}-{q['max_days']} dias", f"round trip, {q['min_days']}-{q['max_days']} days")
+            + (tr(lang, f"ida e volta, {stay(q)} dias", f"round trip, {stay(q)} days")
                if rt else tr(lang, "só ida", "one way"))
             + conditions(q, lang)
             + tr(lang, f"\nIda entre {d0} e {d1}. Cache: {len(fares)} destinos; confirmei {len(fares[:LIVE])} ao vivo "
@@ -313,48 +391,134 @@ def run_explore(q: dict, lang: str | None) -> tuple[str, list[dict]]:
         tail += tr(lang, "\nSem datas, busquei com ida nos próximos 3 meses.", "\nNo dates given, so I searched the next 3 months.")
     links = [{"label": f"{c['name']} {_fmt(c['dep'])}" + (f"→{_fmt(c['ret'])}" if c["ret"] else ""), "url": c["url"]}
              for c in live if c["url"]]
-    return "\n".join([head, "", *lines, tail]), links
+    return "\n".join([head, "", *lines, tail]), links, [f"dest:{f['dest']}" for f in fares[:LIVE]]
 
 
-def run(q: dict, lang: str | None = None) -> tuple[str, list[dict]]:
-    """Execute a validated request. Returns (message, link buttons)."""
+def award_lines(q: dict, cash: float, lang: str | None) -> list[str]:
+    """Miles block for a route search: cheapest award each way, the best same-program round trip, and what a
+    thousand miles are worth against the cash fare. Seats.aero cache only: costs no SerpApi search."""
+    if not server.SEATS_KEY:
+        return [tr(lang, "\nBusca com milhas: desativada (precisa da chave SEATS_AERO_KEY no .env).",
+                   "\nMiles search: off (needs SEATS_AERO_KEY in .env).")]
+    cabin, progs = q["cabin"], q["award_programs"] or None
+    out = server.awards(q["origin_airports"], q["destination_airports"], q["depart_from"], q["depart_to"], cabin, progs)
+    if q.get("round_trip"):
+        d0, d1 = date.fromisoformat(q["depart_from"]), date.fromisoformat(q["depart_to"])
+        back = server.awards(q["destination_airports"], q["origin_airports"],
+                             (d0 + timedelta(days=q["min_days"])).isoformat(),
+                             (d1 + timedelta(days=q["max_days"])).isoformat(), cabin, progs)
+    else:
+        back = []
+    k = lambda m: f"{m / 1000:g} mil" if lang != "en" else f"{m / 1000:g}k"
+    seg = lambda a: f"{k(a['miles'])} {a['program']} ({_fmt(a['date'])}, {a['airlines'] or '?'}{', direto' if a['direct'] and lang != 'en' else ', nonstop' if a['direct'] else ''})"
+    pt_cabin = {"economy": "econômica", "premium": "premium", "business": "executiva", "first": "primeira classe"}[cabin]
+    label = tr(lang, f"\nCom milhas ({pt_cabin}, por pessoa, sem taxas):", f"\nWith miles ({cabin}, per person, taxes not included):")
+    if not out:
+        return [label, tr(lang, "  nenhum assento de resgate no cache nessas datas.", "  no award seats cached on these dates.")]
+    lines = [label, tr(lang, "  ida: ", "  out: ") + seg(out[0])]
+    total = out[0]["miles"]
+    if q.get("round_trip"):
+        if not back:
+            return lines + [tr(lang, "  volta: nenhum assento de resgate no cache.", "  back: no award seats cached.")]
+        lines.append(tr(lang, "  volta: ", "  back: ") + seg(back[0]))
+        # same program both ways (one account), with a return inside the requested stay
+        pairs = [(a, b) for a in out for b in back if a["program"] == b["program"]
+                 and q["min_days"] <= (date.fromisoformat(b["date"]) - date.fromisoformat(a["date"])).days <= q["max_days"]]
+        if pairs:
+            a, b = min(pairs, key=lambda p: p[0]["miles"] + p[1]["miles"])
+            total = a["miles"] + b["miles"]
+            lines.append(tr(lang, f"  ida e volta pelo {a['program']}: {k(total)} ({_fmt(a['date'])} → {_fmt(b['date'])})",
+                            f"  round trip on {a['program']}: {k(total)} ({_fmt(a['date'])} → {_fmt(b['date'])})"))
+        else:
+            total = out[0]["miles"] + back[0]["miles"]
+            if out[0]["program"] != back[0]["program"]:
+                lines.append(tr(lang, f"  (programas diferentes na ida e na volta: {k(total)} no total)",
+                                f"  (different programs each way: {k(total)} in total)"))
+    if cash < float("inf"):
+        lines.append(tr(lang, f"  cada mil milhas valem ~{money(cash / total * 1000)} contra o preço em dinheiro "
+                              "(sem descontar as taxas do resgate).",
+                        f"  each thousand miles is worth ~{money(cash / total * 1000)} against the cash fare "
+                        "(before award taxes)."))
+    return lines
+
+
+def stay(q: dict) -> str:
+    return str(q["min_days"]) if q["min_days"] == q["max_days"] else f"{q['min_days']}-{q['max_days']}"
+
+
+def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) -> tuple[str, list[dict], list[str]]:
+    """Execute a validated request, skipping date pairs (or destinations) already checked in this session.
+    Returns (message, link buttons, keys of what was checked live)."""
     if q.get("_explore"):
-        return run_explore(q, lang)
-    picks, n_cached = candidates(q)
+        return run_explore(q, lang, exclude)
+    rt = bool(q.get("round_trip"))
+    sep = rt and q.get("separate_tickets")
+    # separate tickets cost 3 searches per pair, so a deep scan prices half as many pairs that way
+    picks, n_cached = candidates(q, exclude, one_way_first=sep, n=max(SEP_PAIRS, n // 2) if sep else n)
     before = server._month_calls()
-    ms = q.get("max_stops")
+    ms, mh = q.get("max_stops"), q.get("max_hours")
     results = []
     for dep, ret in picks:
-        r = server.search_flights(q["origin_airports"], q["destination_airports"], dep, ret, limit=30,
-                                  max_hours=q.get("max_hours"))
+        r = server.search_flights(q["origin_airports"], q["destination_airports"], dep, ret, limit=30, max_hours=mh)
         opts = r["options"]
         ok = [o for o in opts if fits(o, q)]
-        results.append({"dep": dep, "ret": ret, "ok": ok[0] if ok else None, "any": opts[0] if opts else None,
-                        "url": r["google_flights_url"]})
+        row = {"dep": dep, "ret": ret, "ok": ok[0] if ok else None, "any": opts[0] if opts else None,
+               "pref": next((o for o in ok if airline_match(o, q)), None), "url": r["google_flights_url"], "split": None}
+        if sep:  # same dates as two one-way tickets
+            out = [o for o in server.search_flights(q["origin_airports"], q["destination_airports"], dep,
+                                                    limit=30, max_hours=mh)["options"] if fits(o, q)]
+            back = [o for o in server.search_flights(q["destination_airports"], q["origin_airports"], ret,
+                                                     limit=30, max_hours=mh)["options"] if fits(o, q)]
+            if out and back:
+                row["split"] = (out[0], back[0])
+        results.append(row)
     used = server._month_calls() - before
 
-    rt = bool(q.get("round_trip"))
+    total = lambda x: min(x["ok"]["price"] if x["ok"] else float("inf"),
+                          sum(o["price"] for o in x["split"]) if x["split"] else float("inf"))
     d0, d1, left = _fmt(q["depart_from"]), _fmt(q["depart_to"]), server.days_until(q["depart_from"])
     head = (f"{q['origin_airports']} → {q['destination_airports']}, "
-            + (tr(lang, f"ida e volta, {q['min_days']}-{q['max_days']} dias", f"round trip, {q['min_days']}-{q['max_days']} days")
+            + (tr(lang, f"ida e volta, {stay(q)} dias", f"round trip, {stay(q)} days")
                if rt else tr(lang, "só ida", "one way"))
             + conditions(q, lang)
             + tr(lang, f"\nIda entre {d0} e {d1} (faltam {left} dias). "
-                       f"Cache: {n_cached} preços; confirmei {len(picks)} datas ao vivo ({used} buscas pagas).",
+                       f"Cache: {n_cached} preços; testei {len(picks)} datas novas ao vivo ({used} buscas pagas).",
                        f"\nDeparting between {d0} and {d1} ({left} days from now). "
-                       f"Cache: {n_cached} fares; checked {len(picks)} dates live ({used} paid searches)."))
-    found = sorted((x for x in results if x["ok"]), key=lambda x: x["ok"]["price"])
-    lines = [f"{i}) {_line(x['ok'], x['dep'], x['ret'], lang)}" for i, x in enumerate(found, 1)]
+                       f"Cache: {n_cached} fares; checked {len(picks)} new dates live ({used} paid searches)."))
+    found = sorted((x for x in results if total(x) < float("inf")), key=total)
+    lines = []
+    for i, x in enumerate(found, 1):
+        lines.append(f"{i}) " + (_line(x["ok"], x["dep"], x["ret"], lang) if x["ok"]
+                                 else f"{_fmt(x['dep'])} → {_fmt(x['ret'])}: " + tr(lang, "sem ida e volta", "no round trip")))
+        if x["split"]:
+            o, b = x["split"]
+            lines.append(tr(lang, "   separadas: ", "   separate tickets: ") + money(o["price"] + b["price"])
+                         + tr(lang, f" (ida {money(o['price'])} {', '.join(o['airlines'])} + volta {money(b['price'])} {', '.join(b['airlines'])})",
+                              f" (out {money(o['price'])} {', '.join(o['airlines'])} + back {money(b['price'])} {', '.join(b['airlines'])})"))
     if not lines:
         lines = [tr(lang, "Nenhum voo encontrado com essas condições nas datas testadas.",
                     "No flights matched these conditions on the dates checked.")]
-    best = found[0]["ok"]["price"] if found else float("inf")
+    best = total(found[0]) if found else float("inf")
+    if q.get("airlines"):
+        names = ", ".join(q["airlines"])
+        pref = min((x for x in results if x["pref"]), key=lambda x: x["pref"]["price"], default=None)
+        lines.append(tr(lang, f"\nCom {names}: ", f"\nWith {names}: ")
+                     + (_line(pref["pref"], pref["dep"], pref["ret"], lang) if pref
+                        else tr(lang, "nenhum voo nas datas testadas.", "no flights on the dates checked.")))
     extra = [x for x in results if x["any"] and x["any"]["stops"] > (ms if ms is not None else 99)
              and x["any"]["price"] <= MUCH_CHEAPER * best]
     if extra:
         x = min(extra, key=lambda x: x["any"]["price"])
         lines.append(tr(lang, "\nCom mais escalas, bem mais barato: ", "\nWith more stops, much cheaper: ")
                      + _line(x["any"], x["dep"], x["ret"], lang))
+    if q.get("points"):
+        lines += award_lines(q, best, lang)
+    mp = q.get("max_price")
+    if mp and best > mp:
+        lines.append(tr(lang, f"\nNada até {money(mp)} nessas datas" + (f": o mais perto foi {money(best)}." if found else ".")
+                              + " Mande \"mais opções\" para eu testar outras datas, ou crie um /alerta para eu avisar se baixar.",
+                        f"\nNothing under {money(mp)} on these dates" + (f": the closest was {money(best)}." if found else ".")
+                        + " Send \"more options\" to try other dates, or create an /alerta and I'll tell you if it drops."))
     n = q.get("adults") or 1
     tail = tr(lang, "\nPreços por adulto" + (", ida e volta" if rt else "") + ".",
               "\nPrices per adult" + (", round trip" if rt else "") + ".")
@@ -368,10 +532,10 @@ def run(q: dict, lang: str | None = None) -> tuple[str, list[dict]]:
                          "(ex: \"em abril\").",
                    "\nYou gave no dates, so I searched departures in the next 3 months. Name a period to refine "
                    "(e.g. \"in April\").")
-    tail += tr(lang, "\nPara acompanhar o preço, crie um /alerta.", "\nTo track the price, create an /alerta.")
+    tail += tr(lang, "\nPara ver outras datas, mande \"mais opções\".", "\nFor other dates, send \"more options\".")
     links = [{"label": f"Google Flights {_fmt(x['dep'])}" + (f"→{_fmt(x['ret'])}" if x["ret"] else ""), "url": x["url"]}
              for x in found if x["url"]]
-    return "\n".join([head, "", *lines, tail]), links
+    return "\n".join([head, "", *lines, tail]), links, [key(dep, ret) for dep, ret in picks]
 
 
 def selftest():
@@ -395,6 +559,11 @@ def selftest():
     assert validate(fixed, t) is None and fixed["depart_to"] == "2026-12-10" and fixed["max_days"] == 18
     ow = {**q, "round_trip": False, "depart_to": None}
     assert validate(ow, t) is None and ow["depart_to"] == "2027-04-01"
+    assert resolve("Japan", "JPN", "NRT,HND") is None  # not Washington
+    assert resolve("Toquio", "TYO", None) == ("TYO", "HND,NRT")  # Portuguese spelling, code agrees
+    assert resolve("Rio", "RIO", None)[0] == "RIO"  # short form of Rio de Janeiro
+    jp = {**q, "destination_city": "Japan", "destination_code": "JPN"}
+    assert validate(jp, t) is None and jp["_explore"] and jp["destination_region"] == "country:JP"
     print("search selftest ok")
 
 
