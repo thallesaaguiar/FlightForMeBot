@@ -4,7 +4,7 @@ A Telegram bot and MCP server that looks for cheap flights and watches prices fo
 
 You write what you want ("Madrid to Tokyo from April 2027, at least 15 days, up to one stop") and the bot searches the best date combinations, compares round trips with separate one-way tickets, and replies with prices and booking buttons. You can also set price alerts and get a message when a fare drops under your target.
 
-It runs fine on a local model through [Ollama](https://ollama.com), with no paid LLM. Fares come from two sources: free cached prices from Aviasales (Travelpayouts Data API) and live Google Flights prices (SerpApi).
+It runs fine on a local model through [Ollama](https://ollama.com), with no paid LLM. Fares come from free cached prices from Aviasales (Travelpayouts Data API) and live Google Flights prices, from SerpApi and, optionally, FlightPowers (both searched together, cheapest wins).
 
 `/start` lets each user pick Portuguese or English. Prices are shown in BRL by default. The code and the prompts are in English.
 
@@ -20,6 +20,15 @@ Searching
 - Separate tickets: prices the same dates as two one-way tickets next to the round trip.
 - A preferred airline ("Air China") gets its own line. A budget is reported as met or missed, with the closest price.
 - Booking buttons open the airline or agency page directly.
+- Two live sources at once: with `FLIGHTPOWERS_KEY` set, every live search asks SerpApi and FlightPowers in parallel and merges the answers, one row per itinerary at the lower price. If one source fails or runs out of quota, the other keeps working.
+- "Searching, one moment…" is sent as soon as the request is understood, before the slow part.
+
+Hotels
+
+- After the flight results the bot asks whether you want hotels, and for which of the listed date pairs (buttons).
+- It shows 3 picks from Google Hotels (1 SerpApi search): best reviewed, best location and best value (cheapest among well-rated). Hostels and capsules are left out, and hotels need at least 100 reviews.
+- "More hotels" shows the next 3 from the same cached search, no extra cost.
+- "Which days are cheaper?" prices the same stay moved by -7, -3, +3 and +7 days (up to 4 paid searches) and offers to redo the flight search on the cheaper dates.
 
 Alerts
 
@@ -39,7 +48,7 @@ Also
 message ──▶ local LLM reads it into parameters (route, dates, stay, stops, budget)
         ──▶ code checks them against the message and reference lists
         ──▶ free cache scores every date pair
-        ──▶ 3 live Google Flights searches confirm the best ones
+        ──▶ 3 live Google Flights searches (SerpApi + FlightPowers) confirm the best ones
         ──▶ code writes the reply (no LLM)
 ```
 
@@ -50,16 +59,67 @@ The model only reads the request. Everything else is fixed code, which is why a 
 - Months, "3 weeks", "10 to 14 days" and "from April" are also read from the text when the model misses them.
 - Requests for miles, programs and cabins are read from the text by code alone.
 
+## Example conversation
+
+A real chat, translated notes in brackets. This run used SerpApi only; the searches show 0 paid searches because the results were still in the 6 hour cache.
+
+```
+You: Quero viajar de Madrid para Tóquio, no Japão, a partir de abril de 2027. Quero ficar pelo menos 15 dias
+     lá, sem contar as horas de voo. Pode ser ida e volta juntos ou bilhetes separados, até 1 escala.
+     Mostre as melhores combinações de datas.
+Bot: Buscando, aguarde um momento…   [searching, one moment]
+Bot: MAD → HND,NRT, ida e volta, 15-25 dias, até 1 escala(s)
+     Ida entre 01/04 e 31/05 (faltam 171 dias). Cache: 4 preços; testei 2 datas novas ao vivo (0 buscas pagas).
+
+     1) 15/04 → 05/05 (20 dias): R$ 5.217 · Air China · 1 escala(s) · 17h00
+        ↳ Separadas: R$ 6.957 (ida R$ 3.545 China Southern + volta R$ 3.412 Cathay Pacific)
+
+     2) 11/04 → 05/05 (24 dias): R$ 5.602 · Cathay Pacific · 1 escala(s) · 19h05
+        ↳ Separadas: R$ 5.582 (ida R$ 2.170 Air China + volta R$ 3.412 Cathay Pacific)
+
+     Preços por adulto, ida e volta.
+     Interpretado por claude.
+
+You: Refaça a busca com as melhores combinações   [redo the search with the best combinations]
+Bot: 1) 13/05 → 28/05 (15 dias): R$ 3.468 · Air China · 1 escala(s) · 21h00
+        ↳ Separadas: R$ 4.793 (ida R$ 2.170 Air China + volta R$ 2.623 Air China)
+
+     2) 12/04 → 05/05 (23 dias): R$ 5.836 · Iberia · direto · 14h00
+        ↳ Separadas: R$ 6.220 (ida R$ 2.808 ITA + volta R$ 3.412 Cathay Pacific)
+
+Bot: Quer que eu busque hotéis em Tokyo? Em quais datas?   [want hotels? which dates?]  [🏨 ①] [🏨 ②] [Não]
+You: (taps ①)
+Bot: Hotéis em Tokyo, 13/05 → 28/05 (15 noites):
+
+     ⭐ Melhor avaliado
+     Ryokan Sawanoya Tokyo
+     4.8 (374 avaliações) · localização 3.2
+     R$ 294/noite (total R$ 4.413)
+
+     📍 Melhor localização
+     ONE@Tokyo by insomnia
+     4.3 (1010 avaliações) · localização 4.6 · 3★
+     R$ 608/noite (total R$ 9.116)
+
+     💰 Melhor custo-benefício
+     plat hostel keikyu asakusa karin
+     4.8 (318 avaliações) · localização 3.8 · 2★
+     R$ 99/noite (total R$ 1.487)
+```
+
+The last pick is a hostel; this run came before hostels were filtered out.
+
 ## What it costs
 
 | Source | Cost | Used for |
 |---|---|---|
 | Travelpayouts Data API | free | price calendars, date scoring, destinations from an origin |
 | SerpApi (Google Flights) | 1 search per request, 250 free per month | live prices, booking links |
+| FlightPowers (optional) | free plan 10 searches per month, then US$ 10 for 2,500 on RapidAPI | second live Google Flights source |
 | Ollama | free, runs on your machine | reading requests |
 | Seats.aero (optional) | US$ 9.99 per month | miles and points |
 
-A guided search uses 3 paid searches. Separate tickets use 3 per date pair (round trip, outbound, return), and a day-by-day scan up to 12. Each alert uses about 30 per month, plus 1 or 2 for booking links when it fires. `SERPAPI_MONTHLY_CAP` stops all paid searches once the monthly count is reached.
+A guided search uses 3 paid SerpApi searches (and, with FlightPowers on, about the same number of FlightPowers calls, one per airport pair). Separate tickets use 3 per date pair (round trip, outbound, return), and a day-by-day scan up to 12. Each alert uses about 30 per month, plus 1 or 2 for booking links when it fires. `SERPAPI_MONTHLY_CAP` stops all paid searches once the monthly count is reached.
 
 The cache only has fares someone searched on Aviasales in the last few days. Popular routes are well covered. Far-off dates, exact stay lengths and small airports often have gaps, and then the bot spreads its live searches across the window.
 
@@ -116,10 +176,12 @@ Everything lives in `.env`. [.env.example](.env.example) has the full list with 
 | `LLM_MAX_SEARCHES` | `10` | paid searches allowed per `/agente` question |
 | `EXTRACT_EFFORT` | `low` | reasoning effort for reading requests (`low`, `medium`, `high`) |
 | `SEATS_AERO_KEY` | | enables miles and points |
+| `FLIGHTPOWERS_KEY` | | RapidAPI key; enables FlightPowers as a second live source next to SerpApi |
+| `FLIGHTPOWERS_MONTHLY_CAP` | `2500` | monthly hard stop for FlightPowers calls |
 | `SERPAPI_MONTHLY_CAP` | `250` | monthly hard stop for paid searches; `0` blocks every search |
 | `CURRENCY` | `BRL` | currency for prices and messages |
 
-The LLM fallback moves to the next provider only when one fails (error, timeout, no credit), not when an answer is poor.
+The LLM fallback moves to the next provider only when one fails (error, timeout, no credit), not when an answer is poor. Reading a request follows the same order as `LLM`: with `LLM=claude,ollama`, Claude reads it and Ollama is only the backup. Put `ollama` first to read requests locally.
 
 ## Telegram commands
 
@@ -212,6 +274,8 @@ For comparison, the same Madrid to Tokyo request in agent mode cost about US$ 0.
 
 ## Limitations
 
+- FlightPowers is read from its documented response and from responses captured on the free plan (10 searches per month); the free plan runs out after a few searches, so a paid RapidAPI plan is needed for regular use.
+- Hotel search needs a SerpApi search each and only covers Google Hotels prices.
 - It finds fares and links to the booking page. It does not buy tickets.
 - Separate tickets are separate bookings: if the first flight is late, the second airline does not have to rebook you.
 - On round trips, the stops and duration shown are for the outbound flight. Google Flights only details the return after the outbound is chosen.
@@ -243,7 +307,7 @@ Search sessions and agent chats stay in memory and are lost when the bot restart
 | `search.py` | guided search: validation, places, date selection, live checks, reply, miles block |
 | `llm.py` | request extraction and its text checks, agent tool loop, provider fallback |
 | `alerts.py` | alerts, plans and quotas, `/alerta` parsing, periodic check |
-| `server.py` | data sources, cache, MCP tools |
+| `server.py` | data sources (SerpApi, FlightPowers, Travelpayouts, Hotels), cache, MCP tools |
 | `extract_eval.py` | extraction accuracy check |
 
 ## License

@@ -26,7 +26,7 @@ MAX_STEPS = 15    # tool-call rounds per question, stops runaway loops burning S
 
 # name: (key env var, OpenAI-compatible base_url or None for the Anthropic SDK, model)
 PROVIDERS = {
-    "claude": ("ANTHROPIC_API_KEY", None, os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")),
+    "claude": ("ANTHROPIC_API_KEY", None, os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")),
     "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai/",
                os.environ.get("GEMINI_MODEL", "gemini-flash-latest")),
     "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com", os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")),
@@ -191,7 +191,7 @@ Examples (today 2026-09-29):
   "max_stops":null,"more_stops_if_much_cheaper":false,"missing":""}}
 These examples only show the format: take every value from the user's message, never from the examples."""
 # the extraction is easy, so try the free local model first
-EXTRACT_ORDER = sorted(ORDER, key=lambda p: p != "ollama")
+EXTRACT_ORDER = ORDER  # follows LLM= in .env; put ollama first there to read requests locally
 EXTRACT_EFFORT = os.environ.get("EXTRACT_EFFORT", "low")  # gpt-oss thinking level for extraction; "" = model default
 
 

@@ -6,6 +6,7 @@
 import os
 import re
 import time
+from datetime import date, timedelta
 
 import httpx
 
@@ -28,7 +29,8 @@ last_seen: dict[int, float] = {}
 DEEP = re.compile(r"data por data|dia a dia|dia por dia|todas as datas|todas as combina|cada data|varredura"
                   r"|every date|day by day|all dates")
 MORE = re.compile(r"mais op|outras op|outras data|outras combina|mais combina|mais barat|outras busca|mais resultad"
-                  r"|more option|other date|cheaper|more result")
+                  r"|melhores (?:combina|op|data)|refa[cz]|de novo|novamente"
+                  r"|more option|other date|cheaper|more result|best (?:combination|option|date)|redo|again")
 LANG_CHOICES = [("🇧🇷 Português", "lang:pt"), ("🇬🇧 English", "lang:en")]
 
 
@@ -182,6 +184,9 @@ def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | No
                           "region. For other dates, send \"more options\". For a new search, use /buscar."))
             return
         s["q"] = q
+        s.pop("hotel_ctx", None)  # a new flight search ends the hotel conversation
+        send(chat, tr(lang, "Buscando, aguarde um momento…", "Searching, one moment…"))
+        typing(chat)
         tried = s.setdefault("tried", set())  # date pairs / destinations already checked live in this session
         if not more:
             tried.clear()
@@ -191,6 +196,16 @@ def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | No
         send(chat, msg + tr(lang, "\n\nPode ajustar em texto (ex: \"e em junho?\", \"aceito 2 escalas\"). ",
                             "\n\nYou can refine it in text (e.g. \"what about June?\", \"2 stops is fine\"). ")
              + tr(lang, f"Interpretado por {q['_provider']}.", f"Read by {q['_provider']}."), links)
+        if q.get("_options") and not q.get("_explore"):
+            city = q.get("destination_city") or q.get("destination_code")
+            s["hid"] = s.get("hid", 0) + 1  # buttons of an older search must not use this search's dates
+            s["hotel"] = {"id": s["hid"], "city": city, "options": q["_options"], "adults": q.get("adults") or 1}
+            nums = "①②③"
+            rows = "\n".join(f"{nums[i]} {search._fmt(d)} → {search._fmt(r)}" for i, (d, r) in enumerate(q["_options"]))
+            send(chat, tr(lang, f"Quer que eu busque hotéis em {city}? Em quais datas?\n{rows}",
+                          f"Want me to look for hotels in {city}? Which dates?\n{rows}"),
+                 choices=[(tr(lang, f"🏨 Datas {nums[i]}", f"🏨 Dates {nums[i]}"), f"hotel:{i}:{s['hid']}")
+                          for i in range(len(q["_options"]))] + [(tr(lang, "Não", "No"), f"hotel:no:{s['hid']}")])
     except Exception as e:
         alerts.log_miss(chat, text, f"error: {type(e).__name__}: {e}")
         send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
@@ -201,12 +216,130 @@ def on_callback(cb: dict):
     httpx.post(f"{TG}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=10)
     chat = (cb.get("message") or {}).get("chat", {}).get("id")
     data = cb.get("data") or ""
-    if not chat or not data.startswith("lang:") or (chat not in ALLOWED and not OPEN_SIGNUP):
+    if not chat or (chat not in ALLOWED and not OPEN_SIGNUP):
+        return
+    if data.startswith(("hotel:", "flt:")):
+        kind, choice, hid = (data + ":0").split(":")[:3]
+        return (on_hotel if kind == "hotel" else on_flight_redo)(chat, choice, hid)
+    if not data.startswith("lang:"):
         return
     lang, name = data[5:], cb.get("from", {}).get("first_name", "")
     alerts.set_lang(chat, name, lang)
     for msg in start_messages(level_of(chat), lang, name):
         send(chat, msg)
+
+
+def _stale(chat: int, key: str, hid: str, choice: str) -> bool:
+    """True (and says so) when a button belongs to an older question than the one the session holds."""
+    if str((sessions.get(chat, {}).get(key) or {}).get("id")) == hid:
+        return False
+    if choice != "no":
+        lang = alerts.get_lang(chat) or "pt"
+        send(chat, tr(lang, "Essa pergunta é de uma busca anterior. Use o botão da pergunta mais recente.",
+                      "That question is from an earlier search. Use the button on the latest question."))
+    return True
+
+
+def on_hotel(chat: int, choice: str, hid: str):
+    """Answer to the hotel offer: choice is the index of the flight dates, or "no". One offer = one search."""
+    if _stale(chat, "hotel", hid, choice):
+        return
+    s = sessions[chat]
+    h = s.pop("hotel")
+    lang = alerts.get_lang(chat) or "pt"
+    if choice == "no":
+        return
+    check_in, check_out = h["options"][int(choice)]
+    send(chat, tr(lang, "Buscando hotéis, aguarde um momento…", "Looking for hotels, one moment…"))
+    typing(chat)
+    try:
+        r = server.hotels(h["city"], check_in, check_out, h["adults"])
+        s["hotel_ctx"] = {"id": h["id"], "city": h["city"], "in": check_in, "out": check_out, "adults": h["adults"],
+                          "shown": {p["name"] for p in r["picks"]}}
+        text, links = search.hotel_text(h["city"], r["picks"], check_in, check_out, lang)
+        send(chat, text + tr(lang, "\n\nDiga \"mais hotéis\" para outras opções, ou \"quais dias estão mais baratos?\" "
+                                  "para comparar datas.",
+                             "\n\nSay \"more hotels\" for other options, or \"which days are cheaper?\" to compare dates."), links)
+    except Exception as e:
+        alerts.log_miss(chat, "hotels", f"error: {type(e).__name__}: {e}")
+        send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
+
+
+HOTEL_Q = re.compile(r"hotei|hotel|hospedagem|lodging|accommodation")
+HOTEL_MORE = re.compile(r"mais|outr|more|other|another|else")
+HOTEL_DATES = re.compile(r"(dia|data|day|date).*(barat|cheap)|(barat|cheap).*(dia|data|day|date)")
+SHIFTS = (-7, -3, 3, 7)  # days to move the whole stay; one paid search each
+
+
+def hotel_followup(chat: int, text: str, s: dict, lang: str | None) -> bool:
+    """Free text right after hotel results: more options, or which dates are cheaper. False = not about hotels."""
+    ctx, t = s["hotel_ctx"], search._norm(text)
+    dates, more = bool(HOTEL_DATES.search(t)), bool(HOTEL_Q.search(t) and HOTEL_MORE.search(t))
+    if not (dates or more):
+        return False
+    try:
+        if dates:
+            d_in, d_out = date.fromisoformat(ctx["in"]), date.fromisoformat(ctx["out"])
+            nights = (d_out - d_in).days
+            spans = [(d_in + timedelta(days=k), d_out + timedelta(days=k)) for k in (0, *SHIFTS)]
+            spans = [(a, b) for a, b in spans if a > date.today()]
+            send(chat, tr(lang, f"Comparando {len(spans)} datas de hotel ({len(spans) - 1} buscas pagas), aguarde um momento…",
+                          f"Comparing {len(spans)} hotel dates ({len(spans) - 1} paid searches), one moment…"))
+            typing(chat)
+            rows = []
+            for a, b in spans:
+                pick = next((h for h in server.hotels(ctx["city"], a.isoformat(), b.isoformat(), ctx["adults"])["picks"]
+                             if h["kind"] == "value"), None)
+                if pick:
+                    rows.append({"in": a.isoformat(), "out": b.isoformat(), "pick": pick, "base": a == d_in,
+                                 "total": pick.get("total") or pick["per_night"] * nights})
+            if not any(r["base"] for r in rows):
+                send(chat, tr(lang, "Não consegui comparar: sem hotel bem avaliado nas datas atuais.",
+                              "Couldn't compare: no well-rated hotel on the current dates."))
+                return True
+            base = next(r for r in rows if r["base"])
+            better = sorted((r for r in rows if r["total"] < base["total"]), key=lambda r: r["total"])[:2]
+            ctx["windows"] = better
+            ctx["id"] = ctx["id"] + 1000  # a fresh question: old buttons stop working
+            choices = [(tr(lang, f"✈️ Refazer voo {search._fmt(r['in'])}→{search._fmt(r['out'])}",
+                           f"✈️ Redo flight {search._fmt(r['in'])}→{search._fmt(r['out'])}"), f"flt:{k}:{ctx['id']}")
+                       for k, r in enumerate(better)]
+            msg = search.hotel_dates_text(ctx["city"], rows, lang)
+            if better:
+                send(chat, msg + tr(lang, "\n\nQuer refazer a busca de voo com essas datas?",
+                                    "\n\nWant me to redo the flight search on those dates?"),
+                     choices=choices + [(tr(lang, "Manter", "Keep"), f"flt:no:{ctx['id']}")])
+            else:
+                send(chat, msg + tr(lang, "\n\nAs datas atuais já são as mais baratas.", "\n\nThe current dates are already the cheapest."))
+        else:
+            r = server.hotels(ctx["city"], ctx["in"], ctx["out"], ctx["adults"], exclude=sorted(ctx["shown"]))
+            ctx["shown"] |= {p["name"] for p in r["picks"]}
+            text, links = search.hotel_text(ctx["city"], r["picks"], ctx["in"], ctx["out"], lang, more=True)
+            send(chat, text, links)
+    except Exception as e:
+        alerts.log_miss(chat, text, f"error: {type(e).__name__}: {e}")
+        send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
+    return True
+
+
+def on_flight_redo(chat: int, choice: str, hid: str):
+    """Redo the flight search on one of the cheaper hotel date windows."""
+    if _stale(chat, "hotel_ctx", hid, choice):
+        return
+    s = sessions[chat]
+    ctx, lang = s["hotel_ctx"], alerts.get_lang(chat) or "pt"
+    if choice == "no":
+        return
+    w = ctx["windows"][int(choice)]
+    ctx["id"] += 1  # one redo per question
+    send(chat, tr(lang, "Buscando voos nessas datas, aguarde um momento…", "Searching flights on those dates, one moment…"))
+    typing(chat)
+    try:
+        text, links = search.flight_on(s["q"], w["in"], w["out"], lang)
+        send(chat, text, links)
+    except Exception as e:
+        alerts.log_miss(chat, "flight redo", f"error: {type(e).__name__}: {e}")
+        send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
 
 
 def level_of(chat: int) -> str:
@@ -298,6 +431,8 @@ def main():
             typing(chat)
             if s["mode"] == "agente" and admin:
                 send(chat, *llm.ask(chat, text))
+            elif s.get("hotel_ctx") and hotel_followup(chat, text, s, lang):
+                pass
             else:
                 buscar(chat, name, text, s, admin, lang)
 

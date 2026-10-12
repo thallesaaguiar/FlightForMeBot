@@ -488,17 +488,20 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
     found = sorted((x for x in results if total(x) < float("inf")), key=total)
     lines = []
     for i, x in enumerate(found, 1):
+        if i > 1:
+            lines.append("")  # blank line between options
         lines.append(f"{i}) " + (_line(x["ok"], x["dep"], x["ret"], lang) if x["ok"]
                                  else f"{_fmt(x['dep'])} → {_fmt(x['ret'])}: " + tr(lang, "sem ida e volta", "no round trip")))
         if x["split"]:
             o, b = x["split"]
-            lines.append(tr(lang, "   separadas: ", "   separate tickets: ") + money(o["price"] + b["price"])
+            lines.append(tr(lang, "   ↳ Separadas: ", "   ↳ Separate tickets: ") + money(o["price"] + b["price"])
                          + tr(lang, f" (ida {money(o['price'])} {', '.join(o['airlines'])} + volta {money(b['price'])} {', '.join(b['airlines'])})",
                               f" (out {money(o['price'])} {', '.join(o['airlines'])} + back {money(b['price'])} {', '.join(b['airlines'])})"))
     if not lines:
         lines = [tr(lang, "Nenhum voo encontrado com essas condições nas datas testadas.",
                     "No flights matched these conditions on the dates checked.")]
     best = total(found[0]) if found else float("inf")
+    q["_options"] = [(x["dep"], x["ret"]) for x in found[:3]] if rt else []  # date pairs the hotel offer is based on
     if q.get("airlines"):
         names = ", ".join(q["airlines"])
         pref = min((x for x in results if x["pref"]), key=lambda x: x["pref"]["price"], default=None)
@@ -536,6 +539,57 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
     links = [{"label": f"Google Flights {_fmt(x['dep'])}" + (f"→{_fmt(x['ret'])}" if x["ret"] else ""), "url": x["url"]}
              for x in found if x["url"]]
     return "\n".join([head, "", *lines, tail]), links, [key(dep, ret) for dep, ret in picks]
+
+
+HOTEL_KINDS = {"rating": ("⭐ Melhor avaliado", "⭐ Best reviewed"), "location": ("📍 Melhor localização", "📍 Best location"),
+               "value": ("💰 Melhor custo-benefício", "💰 Best value")}
+
+
+def hotel_text(city: str, picks: list[dict], check_in: str, check_out: str, lang: str | None,
+               more: bool = False) -> tuple[str, list[dict]]:
+    nights = (date.fromisoformat(check_out) - date.fromisoformat(check_in)).days
+    head = tr(lang, f"{'Mais hotéis' if more else 'Hotéis'} em {city}, {_fmt(check_in)} → {_fmt(check_out)} ({nights} noites):",
+              f"{'More hotels' if more else 'Hotels'} in {city}, {_fmt(check_in)} → {_fmt(check_out)} ({nights} nights):")
+    if not picks:
+        return head + "\n" + tr(lang, "Não tenho mais opções com avaliações suficientes nessas datas." if more
+                                 else "Não achei hotéis com avaliações suficientes nessas datas.",
+                                 "No more options with enough reviews on those dates." if more
+                                 else "No hotels with enough reviews on those dates."), []
+    blocks, links = [], []
+    for h in picks:
+        title = HOTEL_KINDS[h["kind"]][0 if lang != "en" else 1]
+        loc = f" · {tr(lang, 'localização', 'location')} {h['location']}" if h.get("location") else ""
+        stars = f" · {h['stars']}★" if h.get("stars") else ""
+        total = f" ({tr(lang, 'total', 'total')} {money(h['total'])})" if h.get("total") else ""
+        blocks.append(f"{title}\n{h['name']}\n{h['rating']} ({h['reviews']} {tr(lang, 'avaliações', 'reviews')}){loc}{stars}"
+                      f"\n{money(h['per_night'])}/{tr(lang, 'noite', 'night')}{total}")
+        if h.get("link"):
+            links.append({"label": h["name"], "url": h["link"]})
+    return head + "\n\n" + "\n\n".join(blocks), links
+
+
+def hotel_dates_text(city: str, rows: list[dict], lang: str | None) -> str:
+    """rows: {in, out, pick (best-value hotel), base}; cheapest total first, with the saving against the current dates."""
+    base = next(r for r in rows if r["base"])
+    lines = []
+    for r in sorted(rows, key=lambda r: r["total"]):
+        h, diff = r["pick"], r["total"] - base["total"]
+        tag = tr(lang, " (datas atuais)", " (current dates)") if r["base"] else (
+            f" ({'-' if diff < 0 else '+'}{money(abs(diff))})")
+        lines.append(f"{_fmt(r['in'])} → {_fmt(r['out'])}: {money(r['total'])} · {h['name']} · {h['rating']}{tag}")
+    return (tr(lang, f"Hotéis em {city}: melhor custo-benefício por datas (mesmas noites).\n\n",
+               f"Hotels in {city}: best value by dates (same nights).\n\n") + "\n".join(lines))
+
+
+def flight_on(q: dict, dep: str, ret: str, lang: str | None) -> tuple[str, list[dict]]:
+    """Live flights for one exact date pair (used when the user moves the trip to cheaper hotel dates)."""
+    r = server.search_flights(q["origin_airports"], q["destination_airports"], dep, ret, limit=30, max_hours=q.get("max_hours"))
+    ok = [o for o in r["options"] if fits(o, q)][:3]
+    lines = [f"{i}) " + _line(o, dep, ret, lang) for i, o in enumerate(ok, 1)] or [
+        tr(lang, "Nenhum voo encontrado com essas condições nessas datas.", "No flights matched these conditions on those dates.")]
+    head = f"{q['origin_airports']} → {q['destination_airports']}" + conditions(q, lang)
+    url = r.get("google_flights_url")
+    return head + "\n\n" + "\n".join(lines), ([{"label": f"Google Flights {_fmt(dep)}→{_fmt(ret)}", "url": url}] if url else [])
 
 
 def selftest():

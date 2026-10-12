@@ -6,10 +6,14 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from datetime import date as date_cls
 from pathlib import Path
 
 import httpx
@@ -29,6 +33,9 @@ CURRENCY = os.environ.get("CURRENCY", "BRL")
 SERP_MONTHLY_CAP = int(os.environ.get("SERPAPI_MONTHLY_CAP", "250"))
 CACHE_TTL = 6 * 3600
 SEATS_KEY = os.environ.get("SEATS_AERO_KEY")  # unset = award (miles/points) search off
+FP_KEY = os.environ.get("FLIGHTPOWERS_KEY")  # unset = FlightPowers off, SerpApi only
+FP_CAP = int(os.environ.get("FLIGHTPOWERS_MONTHLY_CAP", "2500"))
+FP_HOST = "google-flights-live-api.p.rapidapi.com"
 CABINS = {"economy": "Y", "premium": "W", "business": "J", "first": "F"}
 PROGRAMS = ("smiles azul flyingblue aeroplan united american delta emirates etihad qatar turkish lufthansa singapore "
             "virginatlantic alaska qantas velocity jetblue connectmiles ethiopian saudia finnair eurobonus aeromexico").split()
@@ -59,14 +66,25 @@ Never compute how far away a date is yourself: quote days_until_departure from t
 """)
 
 
+_db_lock = threading.RLock()  # SerpApi and FlightPowers run in parallel threads on one connection
+
+
 def _cached(key: str, fetch):
-    row = db.execute("select ts, body from cache where key=?", (key,)).fetchone()
+    with _db_lock:
+        row = db.execute("select ts, body from cache where key=?", (key,)).fetchone()
     if row and time.time() - row[0] < CACHE_TTL:
         return json.loads(row[1])
     body = fetch()
-    db.execute("replace into cache values (?,?,?)", (key, time.time(), json.dumps(body)))
-    db.commit()
+    with _db_lock:
+        db.execute("replace into cache values (?,?,?)", (key, time.time(), json.dumps(body)))
+        db.commit()
     return body
+
+
+def _count(key: str):
+    with _db_lock:
+        db.execute("insert into usage values (?,1) on conflict(month) do update set calls=calls+1", (key,))
+        db.commit()
 
 
 def _month_calls() -> int:
@@ -81,9 +99,7 @@ def serp(**params) -> dict:
         if _month_calls() >= SERP_MONTHLY_CAP:
             raise RuntimeError(f"SerpApi monthly cap reached ({SERP_MONTHLY_CAP}); raise SERPAPI_MONTHLY_CAP after upgrading")
         r = httpx.get("https://serpapi.com/search.json", params={**params, "api_key": os.environ["SERPAPI_KEY"]}, timeout=90)
-        db.execute("insert into usage values (?,1) on conflict(month) do update set calls=calls+1",
-                   (date.today().strftime("%Y-%m"),))
-        db.commit()
+        _count(date.today().strftime("%Y-%m"))
         body = r.json()
         if "error" in body:
             if "hasn't returned any results" in body["error"]:
@@ -130,6 +146,93 @@ def itineraries(body: dict) -> list[dict]:
             "_booking_token": it.get("booking_token"),
             "_departure_token": it.get("departure_token"),
         })
+    return sorted(out, key=lambda x: x["price"])
+
+
+def _price(it: dict) -> float | None:
+    for k in ("total_price_as_number", "price_as_number", "total_price", "price"):
+        v = it.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    return None
+
+
+def _minutes(text: str | None, seconds=None) -> int | None:
+    """"21 hr 30 min" / "27 hr" -> minutes (round trips only give the outbound as text); one-way gives seconds."""
+    if isinstance(seconds, (int, float)):
+        return int(seconds // 60)
+    m = re.fullmatch(r"\s*(?:(\d+)\s*hr)?\s*(?:(\d+)\s*min)?\s*", str(text or ""))
+    return int(m[1] or 0) * 60 + int(m[2] or 0) if m and (m[1] or m[2]) else None
+
+
+def fp_parse(body, max_hours: float | None = None) -> list[dict]:
+    """FlightPowers response -> the itinerary shape itineraries() returns (no clock times or booking tokens).
+    ponytail: field names follow the public docs, not a captured response; check against a real payload."""
+    if isinstance(body, dict):
+        body = next((v for k in ("flights", "itineraries", "results", "data") if isinstance(v := body.get(k), list)), [])
+    out = []
+    for it in body or []:
+        price = _price(it)
+        if price is None:
+            continue
+        rt = "departure_flight_airline" in it  # round trip: outbound fields carry a departure_flight_ prefix
+        pre = "departure_flight_" if rt else ""
+        minutes = _minutes(it.get("departure_flight_duration") if rt else None, it.get("duration_seconds"))
+        if max_hours and minutes and minutes > max_hours * 60:
+            continue
+        names = re.split(r"[|,]", str(it.get(pre + "airline") or ""))
+        out.append({"price": price, "depart": None, "arrive": None, "route": "",
+                    "airlines": sorted({n.strip() for n in names if n.strip()}), "flights": [],
+                    "stops": int(it.get(pre + "stops") or 0), "minutes": minutes, "source": "flightpowers",
+                    "buy_link": it.get("buy_link"), "_booking_token": None, "_departure_token": None})
+    return sorted(out, key=lambda x: x["price"])
+
+
+def _fp_call(frm: str, to: str, date: str, return_date: str | None, adults: int, max_stops: int | None) -> object:
+    payload = {"departure_date": date, "from_airport": frm, "to_airport": to, "currency": CURRENCY, "limit": 15,
+               "sort_type": "Price", "seat_type": 1, "passengers": [1] * adults,
+               **({"max_stops": max_stops} if max_stops is not None else {}),
+               **({"return_date": return_date} if return_date else {})}
+
+    def fetch():
+        month = "fp:" + date_cls.today().strftime("%Y-%m")
+        with _db_lock:
+            row = db.execute("select calls from usage where month=?", (month,)).fetchone()
+        if row and row[0] >= FP_CAP:
+            raise RuntimeError(f"FlightPowers monthly cap reached ({FP_CAP}); raise FLIGHTPOWERS_MONTHLY_CAP")
+        r = httpx.post(f"https://{FP_HOST}/api/google_flights/{'roundtrip' if return_date else 'oneway'}/v1", json=payload,
+                       headers={"X-RapidAPI-Key": FP_KEY, "X-RapidAPI-Host": FP_HOST}, timeout=90)
+        _count(month)
+        if r.headers.get("X-Search-Status") == "empty" or r.status_code == 404:
+            return []
+        r.raise_for_status()
+        return r.json()
+
+    return _cached("fp:" + json.dumps(payload, sort_keys=True), fetch)
+
+
+def fp_flights(origin: str, destination: str, date: str, return_date: str | None = None, adults: int = 1,
+               max_stops: int | None = None, max_hours: float | None = None) -> list[dict]:
+    """FlightPowers (Google Flights, live). One call per airport pair, at most 4 pairs, in parallel."""
+    pairs = [(a, b) for a in origin.split(",") for b in destination.split(",")][:4]
+    with ThreadPoolExecutor(len(pairs)) as ex:
+        bodies = list(ex.map(lambda ab: _fp_call(ab[0], ab[1], date, return_date, adults, max_stops), pairs))
+    return sorted((o for b in bodies for o in fp_parse(b, max_hours)), key=lambda x: x["price"])
+
+
+def merge_options(serp_its: list[dict], fp_its: list[dict]) -> list[dict]:
+    """Cheapest first, one row per itinerary. FlightPowers has no clock times, so the same carriers + stops
+    (+ duration within 15 min when both know it) count as the same flight; the lower price wins. Rows keep the
+    SerpApi option number (booking_options needs it); FlightPowers-only rows have option None and a buy_link."""
+    norm = lambda it: ("".join(sorted(a.lower().replace(" ", "") for a in it["airlines"])), it["stops"])
+    out = [{**it, "source": "serpapi", "option": n} for n, it in enumerate(serp_its, 1)]
+    for f in fp_its:
+        same = next((o for o in out if norm(o) == norm(f) and (not o["minutes"] or not f["minutes"]
+                                                                or abs(o["minutes"] - f["minutes"]) <= 15)), None)
+        if not same:
+            out.append({**f, "option": None})
+        elif f["price"] < same["price"]:
+            same.update(price=f["price"], source="both", buy_link=f["buy_link"])
     return sorted(out, key=lambda x: x["price"])
 
 
@@ -189,15 +292,69 @@ def _search(origin, destination, date, return_date=None, adults=1, max_stops=Non
 def search_flights(origin: str, destination: str, date: str, return_date: str | None = None,
                    adults: int = 1, max_stops: int | None = None, limit: int = 5, country: str = "br",
                    max_hours: float | None = None) -> dict:
-    """LIVE Google Flights, costs 1 paid search. IATA codes, comma-separated for several airports (GRU,VCP,CGH).
+    """LIVE Google Flights, costs 1 paid search (plus FlightPowers calls when FLIGHTPOWERS_KEY is set: both sources are
+    searched at once and merged, cheapest first; options with option=None come only from FlightPowers, use buy_link).
+    IATA codes, comma-separated for several airports (GRU,VCP,CGH).
     Dates YYYY-MM-DD. With return_date, prices are round-trip totals and flights shown are the outbound.
     country = 2-letter point of sale (br, pt, us...). max_hours caps each flight's duration (outbound and return)."""
-    body = _search(origin, destination, date, return_date, adults, max_stops, country,
-                   **({"max_duration": int(max_hours * 60)} if max_hours else {}))
-    return {"currency": CURRENCY, "country": country, "options": public(itineraries(body))[:limit],
+    serp_kw = dict(**({"max_duration": int(max_hours * 60)} if max_hours else {}))
+    if not FP_KEY:
+        body = _search(origin, destination, date, return_date, adults, max_stops, country, **serp_kw)
+        its, errors = public(itineraries(body)), []
+    else:  # both sources at once; one failing is not fatal
+        with ThreadPoolExecutor(2) as ex:
+            fp = ex.submit(fp_flights, origin, destination, date, return_date, adults, max_stops, max_hours)
+            body, errors = {}, []
+            try:
+                body = _search(origin, destination, date, return_date, adults, max_stops, country, **serp_kw)
+            except Exception as e:
+                errors.append(f"serpapi: {type(e).__name__}: {str(e)[:150]}")
+            try:
+                fp_its = fp.result()
+            except Exception as e:
+                fp_its = []
+                errors.append(f"flightpowers: {type(e).__name__}: {str(e)[:150]}")
+        if len(errors) == 2:
+            raise RuntimeError("; ".join(errors))
+        its = [{k: v for k, v in o.items() if not k.startswith("_")} for o in merge_options(itineraries(body), fp_its)]
+    url = body.get("search_metadata", {}).get("google_flights_url") or next((o.get("buy_link") for o in its if o.get("buy_link")), None)
+    return {"currency": CURRENCY, "country": country, "options": its[:limit],
             "days_until_departure": days_until(date),
             "price_insights": body.get("price_insights"),
-            "google_flights_url": body.get("search_metadata", {}).get("google_flights_url"),
+            "google_flights_url": url,
+            **({"source_errors": errors} if errors else {}),
+            "paid_searches_this_month": _month_calls()}
+
+
+def pick_hotels(props: list[dict], min_reviews: int = 100, exclude=()) -> list[dict]:
+    """Three picks from Google Hotels results: best reviewed, best location, best value (cheapest well-rated).
+    ponytail: field names (overall_rating, location_rating, rate_per_night) follow SerpApi's google_hotels docs."""
+    rows = []
+    for h in props:
+        price = (h.get("rate_per_night") or {}).get("extracted_lowest")
+        if (price and (h.get("reviews") or 0) >= min_reviews and h.get("overall_rating")
+                and not re.search(r"hostel|hostal|capsule|cápsula|dormitor", str(h.get("name")), re.I)):
+            rows.append({"name": h.get("name"), "rating": h["overall_rating"], "reviews": h["reviews"],
+                         "location": h.get("location_rating"), "stars": h.get("extracted_hotel_class"), "per_night": price,
+                         "total": (h.get("total_rate") or {}).get("extracted_lowest"), "link": h.get("link")})
+    picks, used = [], set(exclude)
+    for kind, key in (("rating", lambda r: (r["rating"], r["reviews"])), ("location", lambda r: (r["rating"] >= 4.0, r["location"] or 0, r["rating"])),
+                      ("value", lambda r: (r["rating"] >= 4.2, -r["per_night"]))):
+        r = next((r for r in sorted(rows, key=key, reverse=True) if r["name"] not in used), None)
+        if r:
+            used.add(r["name"])
+            picks.append({"kind": kind, **r})
+    return picks
+
+
+@mcp.tool()
+def hotels(city: str, check_in: str, check_out: str, adults: int = 2, exclude: list[str] | None = None) -> dict:
+    """LIVE Google Hotels via SerpApi, costs 1 paid search. Returns 3 picks: best reviewed, best location, best value
+    (cheapest among well-rated). exclude = names already shown, to get the next best ones (same search, cached).
+    Dates YYYY-MM-DD; prices in the configured currency, per night and total."""
+    body = serp(engine="google_hotels", q=f"hotels in {city}", check_in_date=check_in, check_out_date=check_out,
+                adults=adults)
+    return {"currency": CURRENCY, "picks": pick_hotels(body.get("properties") or [], exclude=exclude or ()),
             "paid_searches_this_month": _month_calls()}
 
 
@@ -360,6 +517,23 @@ def selftest():
                "YAvailable": True, "YMileageCost": "30000", "YAirlines": "KL", "YDirect": False}]
     got = parse_awards(sample, "economy")
     assert [(a["program"], a["miles"]) for a in got] == [("flyingblue", 30000), ("smiles", 35000)], got
+    fp = fp_parse([{"total_price_as_number": 4800, "departure_flight_airline": "Air China | Iberia", "departure_flight_stops": 1,
+                    "departure_flight_duration": "17 hr 5 min", "buy_link": "https://g/x"},
+                   {"price_as_number": 5200, "airline": "Iberia", "stops": 0, "duration_seconds": 50400}])
+    assert (fp[0]["airlines"], fp[0]["minutes"], fp[1]["stops"]) == (["Air China", "Iberia"], 1025, 0), fp
+    twin = [{**leg1[0], "airlines": ["Air China", "Iberia"], "stops": 1, "minutes": 1010, "price": 5217}]
+    m = merge_options(twin, fp)
+    assert [(o["airlines"], o["price"], o["source"], o["option"]) for o in m] == [
+        (["Air China", "Iberia"], 4800, "both", 1), (["Iberia"], 5200, "flightpowers", None)], m  # twin merged, cheaper wins
+    assert fp_parse([{"price_as_number": 100, "airline": "X", "stops": 0, "duration_seconds": 99999}], max_hours=10) == []
+    assert _minutes("27 hr") == 1620 and _minutes("nope") is None
+    props = [{"name": "A", "overall_rating": 4.8, "reviews": 900, "location_rating": 3.0, "rate_per_night": {"extracted_lowest": 900}},
+             {"name": "B", "overall_rating": 4.3, "reviews": 500, "location_rating": 4.9, "rate_per_night": {"extracted_lowest": 700}},
+             {"name": "C", "overall_rating": 4.4, "reviews": 300, "location_rating": 4.0, "rate_per_night": {"extracted_lowest": 300}},
+             {"name": "Sky Hostel", "overall_rating": 4.9, "reviews": 900, "location_rating": 4.9, "rate_per_night": {"extracted_lowest": 90}},
+             {"name": "D", "overall_rating": 5.0, "reviews": 3, "rate_per_night": {"extracted_lowest": 50}}]
+    assert [(h["kind"], h["name"]) for h in pick_hotels(props)] == [("rating", "A"), ("location", "B"), ("value", "C")]
+    assert pick_hotels(props, exclude=["A", "B", "C"]) == []
     print("selftest ok")
 
 
