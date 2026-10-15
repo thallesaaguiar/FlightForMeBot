@@ -36,6 +36,7 @@ SEATS_KEY = os.environ.get("SEATS_AERO_KEY")  # unset = award (miles/points) sea
 FP_KEY = os.environ.get("FLIGHTPOWERS_KEY")  # unset = FlightPowers off, SerpApi only
 FP_CAP = int(os.environ.get("FLIGHTPOWERS_MONTHLY_CAP", "2500"))
 FP_HOST = "google-flights-live-api.p.rapidapi.com"
+FP_MAX_PAIRS = int(os.environ.get("FLIGHTPOWERS_MAX_PAIRS", "6"))  # 1 call per airport pair: SAO x TYO is 3x2
 CABINS = {"economy": "Y", "premium": "W", "business": "J", "first": "F"}
 PROGRAMS = ("smiles azul flyingblue aeroplan united american delta emirates etihad qatar turkish lufthansa singapore "
             "virginatlantic alaska qantas velocity jetblue connectmiles ethiopian saudia finnair eurobonus aeromexico").split()
@@ -88,7 +89,8 @@ def _count(key: str):
 
 
 def _month_calls() -> int:
-    row = db.execute("select calls from usage where month=?", (date.today().strftime("%Y-%m"),)).fetchone()
+    with _db_lock:  # guided searches run their live calls in parallel threads
+        row = db.execute("select calls from usage where month=?", (date.today().strftime("%Y-%m"),)).fetchone()
     return row[0] if row else 0
 
 
@@ -213,8 +215,9 @@ def _fp_call(frm: str, to: str, date: str, return_date: str | None, adults: int,
 
 def fp_flights(origin: str, destination: str, date: str, return_date: str | None = None, adults: int = 1,
                max_stops: int | None = None, max_hours: float | None = None) -> list[dict]:
-    """FlightPowers (Google Flights, live). One call per airport pair, at most 4 pairs, in parallel."""
-    pairs = [(a, b) for a in origin.split(",") for b in destination.split(",")][:4]
+    """FlightPowers (Google Flights, live). One call per airport pair, at most FP_MAX_PAIRS, in parallel.
+    Pairs past the cap are covered by SerpApi only (it takes every airport in one search)."""
+    pairs = [(a, b) for a in origin.split(",") for b in destination.split(",")][:FP_MAX_PAIRS]
     with ThreadPoolExecutor(len(pairs)) as ex:
         bodies = list(ex.map(lambda ab: _fp_call(ab[0], ab[1], date, return_date, adults, max_stops), pairs))
     return sorted((o for b in bodies for o in fp_parse(b, max_hours)), key=lambda x: x["price"])
@@ -291,13 +294,15 @@ def _search(origin, destination, date, return_date=None, adults=1, max_stops=Non
 @mcp.tool()
 def search_flights(origin: str, destination: str, date: str, return_date: str | None = None,
                    adults: int = 1, max_stops: int | None = None, limit: int = 5, country: str = "br",
-                   max_hours: float | None = None) -> dict:
+                   max_hours: float | None = None, airlines: str | None = None) -> dict:
     """LIVE Google Flights, costs 1 paid search (plus FlightPowers calls when FLIGHTPOWERS_KEY is set: both sources are
     searched at once and merged, cheapest first; options with option=None come only from FlightPowers, use buy_link).
     IATA codes, comma-separated for several airports (GRU,VCP,CGH).
     Dates YYYY-MM-DD. With return_date, prices are round-trip totals and flights shown are the outbound.
-    country = 2-letter point of sale (br, pt, us...). max_hours caps each flight's duration (outbound and return)."""
-    serp_kw = dict(**({"max_duration": int(max_hours * 60)} if max_hours else {}))
+    country = 2-letter point of sale (br, pt, us...). max_hours caps each flight's duration (outbound and return).
+    airlines = comma-separated IATA airline codes (CA,QR) to see only those carriers."""
+    serp_kw = dict(**({"max_duration": int(max_hours * 60)} if max_hours else {}),
+                   **({"include_airlines": airlines} if airlines else {}))
     if not FP_KEY:
         body = _search(origin, destination, date, return_date, adults, max_stops, country, **serp_kw)
         its, errors = public(itineraries(body)), []
@@ -348,11 +353,12 @@ def pick_hotels(props: list[dict], min_reviews: int = 100, exclude=()) -> list[d
 
 
 @mcp.tool()
-def hotels(city: str, check_in: str, check_out: str, adults: int = 2, exclude: list[str] | None = None) -> dict:
+def hotels(city: str, check_in: str, check_out: str, adults: int = 2, exclude: list[str] | None = None,
+           near: bool = False) -> dict:
     """LIVE Google Hotels via SerpApi, costs 1 paid search. Returns 3 picks: best reviewed, best location, best value
     (cheapest among well-rated). exclude = names already shown, to get the next best ones (same search, cached).
     Dates YYYY-MM-DD; prices in the configured currency, per night and total."""
-    body = serp(engine="google_hotels", q=f"hotels in {city}", check_in_date=check_in, check_out_date=check_out,
+    body = serp(engine="google_hotels", q=f"hotels {'near' if near else 'in'} {city}", check_in_date=check_in, check_out_date=check_out,
                 adults=adults)
     return {"currency": CURRENCY, "picks": pick_hotels(body.get("properties") or [], exclude=exclude or ()),
             "paid_searches_this_month": _month_calls()}

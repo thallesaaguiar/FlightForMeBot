@@ -78,13 +78,29 @@ CASES = [
     ("Quais são as melhores datas para viajar para o japao saindo de Madrid, viagem a partir de Abril até setembro de "
      "2027? Quero ficar pelo menos 15 dias no Japão",
      None, {"origin_code": "MAD", "_explore": True, "destination_region": "country:JP", "depart_from": "2027-04-01",
-            "depart_to": "2027-09-30", "min_days": 15}),
+            "depart_to": "2027-08-10", "min_days": 15}),  # cut where the return still fits Google's ~330 days
     ("Consegue pesquisar voo mais baratos? AirChina estava ficando bem barato", MADRID,
      {"origin_code": "MAD", "destination_code": "TYO",
       "airlines": lambda v: bool(v) and "airchina" in "".join(v).lower().replace(" ", "")}),
     ("ajuste as datas para outras opcoes que fique mais baratos. Minha meta é pagar até uns R$3.600 por pessoa.\n\n"
      "Faça buscas com ida e volta separadas", MADRID,
      {"max_price": 3600.0, "separate_tickets": True, "destination_code": "TYO", "origin_code": "MAD"}),
+    # several destination cities, in to one and back from the other (open jaw)
+    ("A Origem sempre vai ser Madrid na Espanha e o Destino é Tokyo ou Osaka no japao. Quero ida e volta para ambas as "
+     "cidades para ver qual opcao mais barata. Pode ser indo para Tokyo e voltando por osaka. Entre agosto e outubro, "
+     "pelo menos 20 dias",
+     None, {"origin_code": "MAD", "destination_code": "TYO", "separate_tickets": True, "depart_from": "2027-08-01",
+            "depart_to": "2027-08-05", "min_days": 20,  # cut where the return fits Google's ~330 days
+            "destination_airports": lambda v: "KIX" in str(v) and "HND" in str(v)}),
+    ("faça buscas indo e voltando por Osaka tambem", MADRID,
+     {"origin_code": "MAD", "destination_code": "TYO", "separate_tickets": True,
+      "destination_airports": lambda v: "KIX" in str(v) and "NRT" in str(v), "depart_from": "2027-04-01"}),
+    # trip ideas: no destination, the bot suggests
+    ("quero viajar 10 dias saindo de Madrid para qualquer destino em novembro",
+     None, {"origin_code": "MAD", "destination_region": "anywhere", "_explore": True, "depart_from": "2026-11-01",
+            "min_days": 10}),
+    ("me sugere um lugar pra ir saindo de São Paulo em dezembro, uma semana",
+     None, {"origin_code": "SAO", "destination_region": "anywhere", "_explore": True, "min_days": 7}),
     ("e qualquer lugar da Ásia?", MADRID, {"destination_region": "asia", "_explore": True, "origin_code": "MAD",
                                           "depart_from": "2027-04-01"}),
 ]

@@ -5,9 +5,11 @@ Strategy: score every date pair on free cached prices, pick up to BUSCAR_LIVE we
 confirm them with live searches and filter by stops. The reply is built here, not by a model.
 """
 import json
+import math
 import os
 import re
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from difflib import SequenceMatcher
 
@@ -20,9 +22,19 @@ from alerts import money, tr
 LIVE = int(os.environ.get("BUSCAR_LIVE", "3"))  # paid searches per /buscar
 DEEP = int(os.environ.get("BUSCAR_DEEP", "8"))  # dates checked when an admin asks "data por data" / "todas as datas"
 DEFAULT_WINDOW = (13, 103)  # days after tomorrow searched when the user gives no dates (~2 weeks to ~3 months)
-MUCH_CHEAPER = 0.8  # a flight with more stops than asked is shown only if it costs <= 80% of the best allowed one
+SUGGEST = 10  # destinations an open search ("anywhere", "Europe") lists
+PER_COUNTRY = 2  # at most this many of them in one country
+FAR_KM = 3000  # "furthest for the money" only ranks trips at least this long
+PLANE_SHARE = 0.2  # open searches skip round trips flying more than 20% of the stay (2 days in the air for 10 away)
+TOP_DATES = 2  # cheapest date pairs listed by a normal search (a day-by-day scan lists all of them)
+# Google Flights lists flights about 11 months ahead; airline sites sell a bit further. Measured 2026-10-14:
+# 321 days out had fares, 334 came back empty. Searching past it spends paid searches on empty answers.
+HORIZON = int(os.environ.get("GOOGLE_HORIZON_DAYS", "330"))
 MAX_WINDOW = 190  # departure window for searches (alerts keep their own, smaller one): "April to September" fits
-SEP_PAIRS = 2  # date pairs priced as two one-way tickets (3 paid searches each: round trip, outbound, return)
+SEP_PAIRS = 2  # date pairs priced as round trip + one-way each way; the one-way legs are then crossed (see cross)
+FASTER = (1.15, 120)  # a faster option is shown when it costs at most 15% more and saves at least 2h
+MAX_ROWS = 5  # result lines when crossing one-way legs adds rows beyond the date pairs searched
+PRICE_LEVEL = {"low": ("baixo", "low"), "typical": ("normal", "typical"), "high": ("alto", "high")}
 SPREAD = (0, 0.5, 1, 0.25, 0.75, 0.125, 0.375, 0.625, 0.875)  # evenly spaced dates when the cache runs out
 
 # "anywhere in Europe" requests: region -> ISO country codes. Fixed in code so the model can't invent a country.
@@ -131,6 +143,19 @@ def allowed_countries(region: str, origin: str) -> set | None:
     return REGIONS[region]
 
 
+def airline_codes(names: list[str]) -> str:
+    """IATA codes for airline names ("Air China" -> "CA"), for Google's airline filter."""
+    global _codes
+    if _codes is None:
+        airline_names()  # downloads airlines.json when missing
+        _codes = {_norm(a["name"]).replace(" ", ""): a["code"] for a in json.loads((server.ROOT / "data" / "airlines.json")
+                  .read_text()) if a.get("name") and a.get("code")}
+    return ",".join(c for c in (_codes.get(_norm(n).replace(" ", "")) for n in names) if c)
+
+
+_codes = None
+
+
 def airline_match(o: dict, q: dict) -> bool:
     """Preferred airline by name ("Air China" ~ "AirChina")."""
     want = [_norm(a).replace(" ", "") for a in q.get("airlines") or []]
@@ -185,6 +210,12 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
                 f"I couldn't tell the {'origin' if side == 'origin' else 'destination'}. Which city, airport "
                 "or region (e.g. Europe, South America)?")
         q[f"{side}_code"], q[f"{side}_airports"] = place
+        if side == "destination":  # "Tokyo or Osaka": one search over every airport of both cities
+            airports = place[1].split(",")
+            for city in q.get("destination_also") or []:
+                airports += (resolve(city, None, None) or ("", ""))[1].split(",")
+            q["destination_airports"] = ",".join(dict.fromkeys(a for a in airports if a))
+            q["_multi"] = q["destination_airports"] != place[1]
     try:
         q["max_price"] = float(q["max_price"]) if q.get("max_price") else None
     except (TypeError, ValueError):
@@ -219,6 +250,11 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
             d0, d1 = d0.replace(year=d0.year + 1), d1.replace(year=d1.year + 1)
         except ValueError:  # 29/02
             d0, d1 = d0 + timedelta(days=365), d1 + timedelta(days=365)
+    if d0 < (today or date.today()).replace(day=1):  # "agosto a outubro" in late September means next year's
+        try:
+            d0, d1 = d0.replace(year=d0.year + 1), d1.replace(year=d1.year + 1)
+        except ValueError:  # 29/02
+            d0, d1 = d0 + timedelta(days=365), d1 + timedelta(days=365)
     d0 = max(d0, tomorrow)
     if d1 < d0:
         return tr(lang, "As datas de ida já passaram ou estão invertidas.", "The departure dates are in the past or reversed.")
@@ -239,7 +275,42 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
         q["min_days"], q["max_days"] = lo, hi
     if q.get("max_stops") not in (0, 1, 2, None):
         q["max_stops"] = None
-    return None
+    return horizon_cut(q, today or date.today(), lang)
+
+
+def horizon_cut(q: dict, today: date, lang: str | None) -> str | None:
+    """Ends the departure window where the whole trip (return included) still fits in Google's horizon.
+    A trip entirely past it gets an /alerta suggestion instead of searches that can only come back empty."""
+    horizon = today + timedelta(days=HORIZON)
+    rt = bool(q.get("round_trip"))
+    last = horizon - timedelta(days=q["min_days"] if rt else 0)
+    d0, d1 = date.fromisoformat(q["depart_from"]), date.fromisoformat(q["depart_to"])
+    if d1 > last:
+        q["_horizon"] = horizon.isoformat()
+    if d0 <= last:
+        q["depart_to"] = min(d1, last).isoformat()
+        return None
+    end = min(d1 + timedelta(days=q["max_days"] if rt else 0), d0 + timedelta(days=alerts.MAX_WINDOW_DAYS))
+    example = (f"/alerta {q['origin_code']} {q.get('destination_code') or '???'} {d0:%d/%m}-{end:%d/%m}"
+               + (f" {stay(q)}d" if rt else "") + tr(lang, " PREÇO", " PRICE"))
+    return tr(lang, f"O Google Flights só mostra voos até {horizon:%d/%m/%Y} (uns {HORIZON} dias à frente)"
+                    + (", e a volta também precisa caber nisso" if rt else "") + ". O site da companhia às vezes vende "
+                    "um pouco mais longe, mas eu ainda não consigo ver esses preços. As datas abrem aos poucos: crie um "
+                    f"alerta e eu aviso quando aparecer preço, ex:\n{example}",
+              f"Google Flights only lists flights up to {horizon:%d/%m/%Y} (about {HORIZON} days ahead)"
+              + (", and the return has to fit too" if rt else "") + ". Airline sites sometimes sell a little further, "
+              "but I can't see those prices yet. Dates open gradually: create an alert and I'll tell you when prices "
+              f"show up, e.g.:\n{example}")
+
+
+def horizon_note(q: dict, lang: str | None) -> str:
+    if not q.get("_horizon"):
+        return ""
+    h = _fmt(q["_horizon"])
+    return tr(lang, f"\nO Google Flights só mostra voos até {h}, então a ida ficou até {_fmt(q['depart_to'])}. "
+                    "Para datas depois disso, crie um /alerta.",
+              f"\nGoogle Flights only lists flights up to {h}, so departures stop at {_fmt(q['depart_to'])}. "
+              "For later dates, create an /alerta.")
 
 
 def _cached_fares(q: dict, a: dict, cs: list) -> list[dict]:
@@ -295,12 +366,73 @@ def _fmt(d: str) -> str:
     return f"{d[8:]}/{d[5:7]}"
 
 
-def _line(o: dict, dep: str, ret: str | None, lang: str | None) -> str:
-    days = (date.fromisoformat(ret) - date.fromisoformat(dep)).days if ret else 0
-    when = f"{_fmt(dep)} → {_fmt(ret)} ({days} {tr(lang, 'dias', 'days')})" if ret else _fmt(dep)
+def _hm(minutes: int) -> str:
+    return f"{minutes // 60}h{minutes % 60:02d}"
+
+
+def _days(dep: str, ret: str) -> int:
+    return (date.fromisoformat(ret) - date.fromisoformat(dep)).days
+
+
+def _when(dep: str, ret: str | None, lang: str | None) -> str:
+    return f"{_fmt(dep)} → {_fmt(ret)} ({_days(dep, ret)} {tr(lang, 'dias', 'days')})" if ret else _fmt(dep)
+
+
+def _flight(o: dict, lang: str | None, route: bool = False) -> str:
+    """route: show the airports flown (MAD-PEK-KIX) when the destination has several cities."""
     stops = tr(lang, f"{o['stops']} escala(s)", f"{o['stops']} stop(s)") if o["stops"] else tr(lang, "direto", "nonstop")
-    hours = f" · {o['minutes'] // 60}h{o['minutes'] % 60:02d}" if o.get("minutes") else ""
-    return f"{when}: {money(o['price'])} · {', '.join(o['airlines'])} · {stops}{hours}"
+    hours = f" · {_hm(o['minutes'])}" if o.get("minutes") else ""
+    path = f" · {o['route']}" if route and o.get("route") else ""
+    return f"{money(o['price'])} · {', '.join(o['airlines'])} · {stops}{hours}{path}"
+
+
+def _line(o: dict, dep: str, ret: str | None, lang: str | None, route: bool = False) -> str:
+    return f"{_when(dep, ret, lang)}: {_flight(o, lang, route)}"
+
+
+def _split(pair: tuple[dict, dict], lang: str | None, route: bool = False) -> str:
+    o, b = pair
+    leg = lambda x: f"{money(x['price'])} {', '.join(x['airlines'])}" + (f" {x['route']}" if route and x.get("route") else "")
+    return money(o["price"] + b["price"]) + tr(lang, f" (ida {leg(o)} + volta {leg(b)})", f" (out {leg(o)} + back {leg(b)})")
+
+
+def faster(ok: list[dict]) -> dict | None:
+    """Among options cheapest first, the quickest one costing at most FASTER[0] x the cheapest and saving
+    FASTER[1]+ minutes. Round trips only report the outbound duration, so this compares outbounds."""
+    if not ok or not ok[0].get("minutes"):
+        return None
+    top, (most, saves) = ok[0], FASTER
+    quick = [o for o in ok[1:] if o.get("minutes") and o["price"] <= top["price"] * most
+             and top["minutes"] - o["minutes"] >= saves]
+    return min(quick, key=lambda o: (o["minutes"], o["price"]), default=None)
+
+
+def cross(outs: dict, backs: dict, lo: int, hi: int) -> dict[tuple, tuple]:
+    """Every outbound one-way (date -> option) with every return that keeps the stay in lo..hi days:
+    2 + 2 one-way searches price up to 4 date pairs instead of 2."""
+    return {(d, r): (o, b) for d, o in outs.items() for r, b in backs.items() if o and b and lo <= _days(d, r) <= hi}
+
+
+def arrival_city(o: dict) -> str | None:
+    """City name of the airport an option lands at (MAD-PEK-HND -> Tokyo); None when the source gives no route."""
+    _, cities, airport_city, _ = places()
+    code = airport_city.get(str(o.get("route") or "").split("-")[-1])
+    return cities.get(code, {}).get("name") if code else None
+
+
+def cheapest_with(rows: list[dict], q: dict, stops: int) -> tuple[dict, dict] | None:
+    """(row, option): the cheapest flight with exactly `stops` stops on any date searched, inside the hour limit.
+    Live searches ask for every stop count (the stop limit is applied afterwards), so this costs nothing."""
+    any_stops = {**q, "max_stops": None}
+    return min(((x, o) for x in rows for o in x["opts"] if o["stops"] == stops and fits(o, any_stops)),
+               key=lambda xo: xo[1]["price"], default=None)
+
+
+def live_searches(calls: list[tuple], max_hours: float | None) -> list[dict]:
+    """server.search_flights(origin, destination, date[, return]) per call, in parallel: each one waits on the network."""
+    # ponytail: 6 threads; the monthly cap is checked before each call, so parallel calls can pass it by a few
+    with ThreadPoolExecutor(min(6, max(1, len(calls)))) as ex:
+        return list(ex.map(lambda c: server.search_flights(*c, limit=30, max_hours=max_hours), calls))
 
 
 def fits(o: dict, q: dict) -> bool:
@@ -316,10 +448,19 @@ def conditions(q: dict, lang: str | None) -> str:
             + (tr(lang, f", até {money(mp)}", f", under {money(mp)}") if mp else ""))
 
 
+def _km(a: dict, b: dict) -> int:
+    """Great-circle distance between two Travelpayouts coordinates."""
+    la1, lo1, la2, lo2 = map(math.radians, (a["lat"], a["lon"], b["lat"], b["lon"]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return round(12742 * math.asin(math.sqrt(h)))
+
+
 def explore_fares(q: dict) -> list[dict]:
-    """Cheapest cached fare per destination from the origin, inside the region, window, stay, stops and budget."""
+    """Cheapest cached fare per destination from the origin, inside the region, window, stay, stops, hours and budget.
+    A round trip that spends more than PLANE_SHARE of the stay in the air is left out."""
     _, cities, _, _ = places()
     origin, rt, ms, maxp = q["origin_code"], bool(q.get("round_trip")), q.get("max_stops"), q.get("max_price")
+    mh, here = q.get("max_hours"), cities.get(origin, {}).get("coordinates")
     allowed = allowed_countries(q["destination_region"], origin)
     d0, d1 = date.fromisoformat(q["depart_from"]), date.fromisoformat(q["depart_to"])
     dep_months = sorted({(d0 + timedelta(days=i)).isoformat()[:7] for i in range((d1 - d0).days + 1)})
@@ -332,27 +473,65 @@ def explore_fares(q: dict) -> list[dict]:
                 continue
             for t in server.tp_month(origin, None, dm, rm):
                 dest, dep = t["destination"], t["departure_at"][:10]
+                city = cities.get(dest, {})
                 ret = (t.get("return_at") or "")[:10] if rt else None
-                if dest == origin or (allowed is not None and cities.get(dest, {}).get("country_code") not in allowed):
+                if dest == origin or (allowed is not None and city.get("country_code") not in allowed):
                     continue
                 if not q["depart_from"] <= dep <= q["depart_to"] or (maxp and t["price"] > maxp):
                     continue
-                if rt and not (ret and q["min_days"] <= (date.fromisoformat(ret) - date.fromisoformat(dep)).days <= q["max_days"]):
+                if rt and not (ret and q["min_days"] <= _days(dep, ret) <= q["max_days"]):
                     continue
-                if ms is not None and ((t.get("transfers") or 0) > ms or (rt and (t.get("return_transfers") or 0) > ms)):
+                stops = max(t.get("transfers") or 0, (t.get("return_transfers") or 0) if rt else 0)
+                if ms is not None and stops > ms:
+                    continue
+                out_h = (t.get("duration_to") or 0) / 60
+                air_h = out_h + ((t.get("duration_back") or 0) / 60 if rt else 0)
+                if (mh and out_h > mh) or (rt and air_h > PLANE_SHARE * q["min_days"] * 24):
                     continue
                 if dest not in best or t["price"] < best[dest]["price"]:
-                    best[dest] = {"dest": dest, "name": cities.get(dest, {}).get("name", dest), "dep": dep, "ret": ret,
-                                  "price": t["price"]}
+                    best[dest] = {"dest": dest, "name": city.get("name", dest), "country": city.get("country_code", "?"),
+                                  "dep": dep, "ret": ret, "price": t["price"], "stops": stops, "hours": out_h,
+                                  "km": _km(here, city["coordinates"]) if here and city.get("coordinates") else 0}
     return sorted(best.values(), key=lambda f: f["price"])
 
 
+GROUPS = {"cheap": ("🏷️ Mais baratos", "🏷️ Cheapest"), "far": ("💎 Mais longe pelo preço", "💎 Furthest for the money"),
+          "direct": ("✈️ Voos diretos", "✈️ Nonstop")}
+
+
+def suggest(fares: list[dict], n: int = SUGGEST) -> list[tuple[str, dict]]:
+    """Up to n (group, fare): the cheapest, the lowest price per km among trips over FAR_KM, and the cheapest
+    nonstops, at most PER_COUNTRY per country so the list isn't six Spanish cities. Spare slots go to the cheapest.
+    # ponytail: price per km is a rough "good deal"; compare against each route's usual price if it misleads"""
+    taken: list[tuple[str, dict]] = []
+    per: dict[str, int] = {}
+
+    def take(pool, k, group):
+        for f in pool:
+            if k <= 0 or len(taken) >= n:
+                return
+            if any(f is t for _, t in taken) or per.get(f["country"], 0) >= PER_COUNTRY:
+                continue
+            taken.append((group, f))
+            per[f["country"]] = per.get(f["country"], 0) + 1
+            k -= 1
+
+    take(fares, 4, "cheap")
+    take(sorted((f for f in fares if f["km"] >= FAR_KM), key=lambda f: f["price"] / f["km"]), 3, "far")
+    take([f for f in fares if f["stops"] == 0], 3, "direct")
+    take(fares, n, "cheap")
+    order = list(GROUPS)
+    return sorted(taken, key=lambda gf: order.index(gf[0]))  # stable: each group keeps its own order
+
+
 def run_explore(q: dict, lang: str | None, exclude=frozenset()) -> tuple[str, list[dict], list[str]]:
-    """'Anywhere in Europe': rank destinations on the free cache, confirm the LIVE cheapest ones live."""
+    """'Anywhere' or 'anywhere in Europe': SUGGEST destinations in groups from the free cache; the first of each
+    group is confirmed live. q["_dests"] gets (city code, name) per line, for one button each."""
     fares = [f for f in explore_fares(q) if f"dest:{f['dest']}" not in exclude]
     where = region_name(q["destination_region"], lang)
-    rt, ms = bool(q.get("round_trip")), q.get("max_stops")
+    rt = bool(q.get("round_trip"))
     d0, d1 = _fmt(q["depart_from"]), _fmt(q["depart_to"])
+    q["_dests"] = []
     if not fares:
         return tr(lang, f"Não achei preços em cache saindo de {q['origin_airports']} para {where} entre {d0} e {d1}"
                         + (f" até {money(q['max_price'])}" if q.get("max_price") else "")
@@ -360,38 +539,50 @@ def run_explore(q: dict, lang: str | None, exclude=frozenset()) -> tuple[str, li
                   f"I found no cached fares from {q['origin_airports']} to {where} between {d0} and {d1}"
                   + (f" under {money(q['max_price'])}" if q.get("max_price") else "")
                   + ". Try another period, a bigger budget or name a destination."), [], []
+    picks = suggest(fares)
+    check = [f for k, (g, f) in enumerate(picks) if k == 0 or picks[k - 1][0] != g][:LIVE]  # first of each group
     before = server._month_calls()
-    confirmed = []
-    for f in fares[:LIVE]:
-        airports = (resolve(None, f["dest"], None) or (f["dest"], f["dest"]))[1]
-        r = server.search_flights(q["origin_airports"], airports, f["dep"], f["ret"], limit=30, max_hours=q.get("max_hours"))
+    calls = [(q["origin_airports"], (resolve(None, f["dest"], None) or (f["dest"], f["dest"]))[1], f["dep"], f["ret"])
+             for f in check]
+    live = {}
+    for f, r in zip(check, live_searches(calls, q.get("max_hours"))):
         ok = [o for o in r["options"] if fits(o, q)]
-        confirmed.append({**f, "ok": ok[0] if ok else None, "url": r["google_flights_url"]})
+        live[f["dest"]] = (ok[0] if ok else None, r["google_flights_url"])
     used = server._month_calls() - before
-    live = sorted((c for c in confirmed if c["ok"]), key=lambda c: c["ok"]["price"])
     head = (tr(lang, f"Saindo de {q['origin_airports']} para {where}, ", f"From {q['origin_airports']} to {where}, ")
             + (tr(lang, f"ida e volta, {stay(q)} dias", f"round trip, {stay(q)} days")
                if rt else tr(lang, "só ida", "one way"))
             + conditions(q, lang)
-            + tr(lang, f"\nIda entre {d0} e {d1}. Cache: {len(fares)} destinos; confirmei {len(fares[:LIVE])} ao vivo "
+            + tr(lang, f"\nIda entre {d0} e {d1}. Cache: {len(fares)} destinos; confirmei {len(check)} ao vivo "
                        f"({used} buscas pagas).",
-                 f"\nDeparting between {d0} and {d1}. Cache: {len(fares)} destinations; checked {len(fares[:LIVE])} live "
+                 f"\nDeparting between {d0} and {d1}. Cache: {len(fares)} destinations; checked {len(check)} live "
                  f"({used} paid searches)."))
-    lines = [f"{i}) {c['name']}: {_line(c['ok'], c['dep'], c['ret'], lang)}" for i, c in enumerate(live, 1)]
-    if not lines:
-        lines = [tr(lang, "Os preços do cache não se confirmaram ao vivo nas datas testadas.",
-                    "The cached prices did not hold up live on the dates checked.")]
-    more = [f for f in fares[LIVE:LIVE + 5]]
-    if more:
-        lines.append(tr(lang, "\nMais ideias pelo cache (não confirmadas): ", "\nMore ideas from the cache (not checked live): ")
-                     + ", ".join(f"{f['name']} ~{money(f['price'])} ({_fmt(f['dep'])})" for f in more))
-    tail = tr(lang, "\nPreços por adulto. Para ver um destino em detalhe, diga o nome dele (ex: \"pode ser Roma\").",
-              "\nPrices per adult. To look at one destination in detail, name it (e.g. \"Rome then\").")
+    lines, group = [], None
+    for i, (g, f) in enumerate(picks, 1):
+        if g != group:
+            lines += ["", GROUPS[g][lang == "en"]]
+            group = g
+        name = f"{i}) {f['name']} ({f['country']})"
+        ok = live.get(f["dest"], (None,))[0]
+        if ok:
+            text = f"{name}: {_line(ok, f['dep'], f['ret'], lang)} ✓"
+        else:
+            stops = tr(lang, f"{f['stops']} escala(s)", f"{f['stops']} stop(s)") if f["stops"] else tr(lang, "direto", "nonstop")
+            hours = f" · {_hm(round(f['hours'] * 60))}" if f["hours"] else ""
+            gone = tr(lang, " (não confirmado ao vivo)", " (not confirmed live)") if f["dest"] in live else ""
+            text = f"{name}: ~{money(f['price'])} · {_when(f['dep'], f['ret'], lang)} · {stops}{hours}{gone}"
+        lines.append(text + (f" · {f['km']:,} km".replace(",", ".") if g == "far" else ""))
+        q["_dests"].append((f["dest"], f["name"]))
+    tail = tr(lang, "\n✓ = preço confirmado agora. ~ = preço do cache (buscas dos últimos dias), pode ter mudado.\n"
+                    "Preços por adulto. Toque num destino para eu buscar as melhores datas para ele.",
+              "\n✓ = price checked now. ~ = cached price (searches from the last few days), it may have changed.\n"
+              "Prices per adult. Tap a destination and I'll look for its best dates.")
+    tail += horizon_note(q, lang)
     if q.get("_default_dates"):
         tail += tr(lang, "\nSem datas, busquei com ida nos próximos 3 meses.", "\nNo dates given, so I searched the next 3 months.")
-    links = [{"label": f"{c['name']} {_fmt(c['dep'])}" + (f"→{_fmt(c['ret'])}" if c["ret"] else ""), "url": c["url"]}
-             for c in live if c["url"]]
-    return "\n".join([head, "", *lines, tail]), links, [f"dest:{f['dest']}" for f in fares[:LIVE]]
+    links = [{"label": f"{f['name']} {_fmt(f['dep'])}" + (f"→{_fmt(f['ret'])}" if f["ret"] else ""), "url": live[f["dest"]][1]}
+             for f in check if live[f["dest"]][0] and live[f["dest"]][1]]
+    return "\n".join([head, *lines, tail]), links, [f"dest:{f['dest']}" for _, f in picks]
 
 
 def award_lines(q: dict, cash: float, lang: str | None) -> list[str]:
@@ -456,22 +647,25 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
     # separate tickets cost 3 searches per pair, so a deep scan prices half as many pairs that way
     picks, n_cached = candidates(q, exclude, one_way_first=sep, n=max(SEP_PAIRS, n // 2) if sep else n)
     before = server._month_calls()
-    ms, mh = q.get("max_stops"), q.get("max_hours")
-    results = []
-    for dep, ret in picks:
-        r = server.search_flights(q["origin_airports"], q["destination_airports"], dep, ret, limit=30, max_hours=mh)
+    mh, mr = q.get("max_hours"), bool(q.get("_multi"))
+    org, dst = q["origin_airports"], q["destination_airports"]
+    deps, rets = (sorted({d for d, _ in picks}), sorted({r for _, r in picks})) if sep else ([], [])
+    res = live_searches([(org, dst, d, r) for d, r in picks] + [(org, dst, d) for d in deps] + [(dst, org, r) for r in rets], mh)
+    rows: dict[tuple, dict] = {}
+    for (dep, ret), r in zip(picks, res):
         opts = r["options"]
         ok = [o for o in opts if fits(o, q)]
-        row = {"dep": dep, "ret": ret, "ok": ok[0] if ok else None, "any": opts[0] if opts else None,
-               "pref": next((o for o in ok if airline_match(o, q)), None), "url": r["google_flights_url"], "split": None}
-        if sep:  # same dates as two one-way tickets
-            out = [o for o in server.search_flights(q["origin_airports"], q["destination_airports"], dep,
-                                                    limit=30, max_hours=mh)["options"] if fits(o, q)]
-            back = [o for o in server.search_flights(q["destination_airports"], q["origin_airports"], ret,
-                                                     limit=30, max_hours=mh)["options"] if fits(o, q)]
-            if out and back:
-                row["split"] = (out[0], back[0])
-        results.append(row)
+        rows[(dep, ret)] = {"dep": dep, "ret": ret, "ok": ok[0] if ok else None, "fast": faster(ok),
+                            "opts": opts, "pref": next((o for o in ok if airline_match(o, q)), None),
+                            "url": r["google_flights_url"], "insights": r.get("price_insights"), "split": None}
+    if sep:
+        first = lambda r: next((o for o in r["options"] if fits(o, q)), None)
+        outs = {d: first(r) for d, r in zip(deps, res[len(picks):])}
+        backs = {d: first(r) for d, r in zip(rets, res[len(picks) + len(deps):])}
+        for (dep, ret), pair in cross(outs, backs, q["min_days"], q["max_days"]).items():
+            rows.setdefault((dep, ret), {"dep": dep, "ret": ret, "ok": None, "fast": None, "opts": [], "pref": None,
+                                         "url": None, "insights": None})["split"] = pair
+    results = list(rows.values())
     used = server._month_calls() - before
 
     total = lambda x: min(x["ok"]["price"] if x["ok"] else float("inf"),
@@ -485,35 +679,62 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
                        f"Cache: {n_cached} preços; testei {len(picks)} datas novas ao vivo ({used} buscas pagas).",
                        f"\nDeparting between {d0} and {d1} ({left} days from now). "
                        f"Cache: {n_cached} fares; checked {len(picks)} new dates live ({used} paid searches)."))
-    found = sorted((x for x in results if total(x) < float("inf")), key=total)
+    found = sorted((x for x in results if total(x) < float("inf")), key=total)[:TOP_DATES if n <= LIVE else max(len(picks), MAX_ROWS)]
+    direct = cheapest_with(results, q, 0)
     lines = []
     for i, x in enumerate(found, 1):
         if i > 1:
             lines.append("")  # blank line between options
-        lines.append(f"{i}) " + (_line(x["ok"], x["dep"], x["ret"], lang) if x["ok"]
-                                 else f"{_fmt(x['dep'])} → {_fmt(x['ret'])}: " + tr(lang, "sem ida e volta", "no round trip")))
+        if not x["ok"]:  # a crossed date pair only priced as two one-way tickets
+            lines.append(f"{i}) {_when(x['dep'], x['ret'], lang)}: " + tr(lang, "bilhetes separados ", "separate tickets ")
+                         + _split(x["split"], lang, mr))
+            continue
+        lines.append(f"{i}) " + _line(x["ok"], x["dep"], x["ret"], lang, mr))
+        if x["fast"] and x["fast"] is not (direct or [None, None])[1]:  # the nonstop gets its own line below
+            f = x["fast"]
+            lines.append(tr(lang, f"   ↳ Mais rápido (+{money(f['price'] - x['ok']['price'])}, "
+                                  f"{_hm(x['ok']['minutes'] - f['minutes'])} a menos): ",
+                            f"   ↳ Faster (+{money(f['price'] - x['ok']['price'])}, "
+                            f"{_hm(x['ok']['minutes'] - f['minutes'])} less): ") + _flight(f, lang, mr))
         if x["split"]:
-            o, b = x["split"]
-            lines.append(tr(lang, "   ↳ Separadas: ", "   ↳ Separate tickets: ") + money(o["price"] + b["price"])
-                         + tr(lang, f" (ida {money(o['price'])} {', '.join(o['airlines'])} + volta {money(b['price'])} {', '.join(b['airlines'])})",
-                              f" (out {money(o['price'])} {', '.join(o['airlines'])} + back {money(b['price'])} {', '.join(b['airlines'])})"))
+            lines.append(tr(lang, "   ↳ Separadas: ", "   ↳ Separate tickets: ") + _split(x["split"], lang, mr))
+    best = total(found[0]) if found else float("inf")
+    pi = found[0]["insights"] if found else None
+    if pi and pi.get("price_level") in PRICE_LEVEL and found[0]["ok"] and found[0]["ok"]["price"] == best:
+        lo, hi = (pi.get("typical_price_range") or [None, None])[:2]
+        level = PRICE_LEVEL[pi["price_level"]][lang == "en"]
+        lines.append(tr(lang, f"\nPelo Google, o preço da opção 1 está {level} para essa rota",
+                        f"\nGoogle rates option 1's price as {level} for this route")
+                     + (tr(lang, f" (faixa comum {money(lo)} a {money(hi)})", f" (usual range {money(lo)} to {money(hi)})")
+                        if lo and hi else "") + ".")
     if not lines:
         lines = [tr(lang, "Nenhum voo encontrado com essas condições nas datas testadas.",
                     "No flights matched these conditions on the dates checked.")]
-    best = total(found[0]) if found else float("inf")
     q["_options"] = [(x["dep"], x["ret"]) for x in found[:3]] if rt else []  # date pairs the hotel offer is based on
+    q["_hotel_cities"] = [arrival_city(x["ok"] or x["split"][0]) for x in found[:3]] if rt else []
     if q.get("airlines"):
         names = ", ".join(q["airlines"])
         pref = min((x for x in results if x["pref"]), key=lambda x: x["pref"]["price"], default=None)
+        codes = airline_codes(q["airlines"])
+        if not pref and codes and (found or results):
+            # Google lists only some itineraries per search: ask once more for just that airline on the best dates
+            x = (found or results)[0]
+            r = server.search_flights(org, dst, x["dep"], x["ret"], limit=30, max_hours=mh, airlines=codes)
+            o = next((o for o in r["options"] if fits(o, q) and airline_match(o, q)), None)
+            pref = o and {**x, "pref": o}
+            names += tr(lang, " (1 busca paga extra só com ela)", " (1 extra paid search for it alone)")
         lines.append(tr(lang, f"\nCom {names}: ", f"\nWith {names}: ")
-                     + (_line(pref["pref"], pref["dep"], pref["ret"], lang) if pref
+                     + (_line(pref["pref"], pref["dep"], pref["ret"], lang, mr) if pref
                         else tr(lang, "nenhum voo nas datas testadas.", "no flights on the dates checked.")))
-    extra = [x for x in results if x["any"] and x["any"]["stops"] > (ms if ms is not None else 99)
-             and x["any"]["price"] <= MUCH_CHEAPER * best]
-    if extra:
-        x = min(extra, key=lambda x: x["any"]["price"])
-        lines.append(tr(lang, "\nCom mais escalas, bem mais barato: ", "\nWith more stops, much cheaper: ")
-                     + _line(x["any"], x["dep"], x["ret"], lang))
+    vs = lambda o: tr(lang, f" ({'+' if o['price'] >= best else '-'}{money(abs(o['price'] - best))} que a opção 1)",
+                      f" ({'+' if o['price'] >= best else '-'}{money(abs(o['price'] - best))} vs option 1)")
+    if direct and found and all(direct[1] is not x["ok"] for x in found):
+        x, o = direct
+        lines.append(tr(lang, "\n✈️ Voo direto: ", "\n✈️ Nonstop: ") + _line(o, x["dep"], x["ret"], lang, mr) + vs(o))
+    two = cheapest_with(results, q, 2)
+    if two and two[1]["price"] < best:  # a pricier 2-stop flight is never worth a line
+        x, o = two
+        lines.append(tr(lang, "\n🔁 Com 2 escalas: ", "\n🔁 With 2 stops: ") + _line(o, x["dep"], x["ret"], lang, mr) + vs(o))
     if q.get("points"):
         lines += award_lines(q, best, lang)
     mp = q.get("max_price")
@@ -530,6 +751,7 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
                          f"por vez costuma sair mais barato que {n} de uma vez (as tarifas são vendidas em lotes).",
                    f" For {n} adults the best option comes to about {money(best * n)}. Searching and buying one ticket "
                    f"at a time is often cheaper than {n} at once (fares are sold in buckets).")
+    tail += horizon_note(q, lang)
     if q.get("_default_dates"):
         tail += tr(lang, "\nVocê não deu datas, então busquei com ida nos próximos 3 meses. Diga um período para refinar "
                          "(ex: \"em abril\").",
@@ -539,6 +761,37 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
     links = [{"label": f"Google Flights {_fmt(x['dep'])}" + (f"→{_fmt(x['ret'])}" if x["ret"] else ""), "url": x["url"]}
              for x in found if x["url"]]
     return "\n".join([head, "", *lines, tail]), links, [key(dep, ret) for dep, ret in picks]
+
+
+DATE_RE = r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b"
+FILLER = (r"\b(dias?|days?|noites?|nights?|de|do|da|dos|das|desde|ate|a|ao|e|entre|from|to|until|and|um|uma|hote(l|is)|"
+          r"hotels?|hospedagem|proxim[oa]s?|perto|near|close|ao lado|em|no|na|nos|nas|in|at|the|quero|busque|procure)\b")
+
+
+def hotel_requests(text: str, today: date | None = None) -> list[dict]:
+    """Hotel stays written one per line: "17/05 até 19/05 um hotel perto da Disneyland Tóquio".
+    A line with exactly two dates is a stay; what's left after dates and filler words is the place.
+    # ponytail: line-based; "Osaka de 21 a 25 de maio" (dates in words) isn't read, add the LLM if people write that"""
+    tomorrow = (today or date.today()) + timedelta(days=1)
+    out = []
+    for line in re.split(r"[\n;]+", text):
+        ds = re.findall(DATE_RE, line)
+        if len(ds) != 2:
+            continue
+        try:
+            when = []
+            for d, m, y in ds:
+                after = when[0] + timedelta(days=1) if when else tomorrow
+                x = date(int(y) + (2000 if len(y) == 2 else 0), int(m), int(d)) if y else date(after.year, int(m), int(d))
+                when.append(x if y or x >= after else x.replace(year=x.year + 1))
+        except ValueError:
+            continue
+        rest = _norm(re.sub(DATE_RE, " ", line))
+        place = " ".join(re.sub(FILLER, " ", re.sub(r"[^\w\s]", " ", rest)).split())
+        if place and when[1] > when[0]:
+            out.append({"place": place.title(), "near": bool(re.search(r"\b(proxim|perto|near|close|ao lado)", rest)),
+                        "in": when[0].isoformat(), "out": when[1].isoformat()})
+    return out
 
 
 HOTEL_KINDS = {"rating": ("⭐ Melhor avaliado", "⭐ Best reviewed"), "location": ("📍 Melhor localização", "📍 Best location"),
@@ -606,6 +859,8 @@ def selftest():
     assert validate({**q, "destination_code": "Tokyo"}, t)
     past = {**q, "round_trip": False, "depart_from": "2026-01-20", "depart_to": "2026-01-20"}
     assert validate(past, t) is None and past["depart_from"] == "2027-01-20"  # rolled to next year
+    late_start = {**q, "depart_from": "2026-08-01", "depart_to": "2026-10-31"}  # August is gone: next year's
+    assert validate(late_start, t) is None and late_start["depart_from"] == "2027-08-01"
     old = {**q, "round_trip": False, "depart_from": "2024-12-10", "depart_to": "2024-12-10"}
     assert validate(old, t) is None and old["depart_from"] == "2026-12-10"  # model wrote 2024
     assert validate({**q, "min_days": 0}, t)
@@ -618,6 +873,40 @@ def selftest():
     assert resolve("Rio", "RIO", None)[0] == "RIO"  # short form of Rio de Janeiro
     jp = {**q, "destination_city": "Japan", "destination_code": "JPN"}
     assert validate(jp, t) is None and jp["_explore"] and jp["destination_region"] == "country:JP"
+    two = {**q, "destination_city": "Tokyo", "destination_also": ["Osaka", "Tokyo", "Atlantis"]}
+    assert validate(two, t) is None and two["destination_code"] == "TYO" and two["_multi"]
+    assert two["destination_airports"] == "HND,NRT," + resolve("Osaka", None, None)[1]  # dupes and unknowns dropped
+    f = lambda d, price, country, km=500, stops=1: {"dest": d, "price": price, "country": country, "km": km, "stops": stops}
+    fares = [f("A", 100, "ES"), f("B", 110, "ES"), f("C", 120, "ES"), f("D", 130, "IT", stops=0), f("E", 900, "JP", 10000),
+             f("F", 300, "MA", 3500), f("G", 140, "PT", stops=0), f("H", 150, "FR")]
+    got = [(g, x["dest"]) for g, x in suggest(sorted(fares, key=lambda x: x["price"]), 7)]
+    assert got == [("cheap", "A"), ("cheap", "B"), ("cheap", "D"), ("cheap", "G"), ("cheap", "H"),
+                   ("far", "F"), ("far", "E")], got  # C: third Spanish city; F is cheaper per km than E
+    hr = hotel_requests("Agora quero hotéis nas seguintes datas:\n\nDias 17/05 até 19/05 um hotel proximo da Disneyland Toquio"
+                        "\n\nDias 21/05 a 25/05 um Hotel em Osaka\ndias 26/05 a 28/05 um hotel em Kyoto\n"
+                        "Dias 31/05/2027 até 07/06/2027 um hotel em Tokyo\nsó 1 data 02/06 aqui", t)
+    assert [(h["place"], h["near"], h["in"], h["out"]) for h in hr] == [
+        ("Disneyland Toquio", True, "2027-05-17", "2027-05-19"), ("Osaka", False, "2027-05-21", "2027-05-25"),
+        ("Kyoto", False, "2027-05-26", "2027-05-28"), ("Tokyo", False, "2027-05-31", "2027-06-07")], hr
+    assert hotel_requests("28/12 a 03/01 em Lisboa", t)[0]["out"] == "2027-01-03"  # across new year
+    far = {**q, "depart_from": "2027-08-01", "depart_to": "2027-10-31", "min_days": 20, "max_days": 30}
+    assert validate(far, t) is None and far["depart_to"] == "2027-08-05" and far["_horizon"] == "2027-08-25"
+    late = {**q, "depart_from": "2027-09-01", "depart_to": "2027-10-10", "min_days": 20, "max_days": 30}
+    assert "/alerta MAD TYO 01/09-09/11 20-30d" in validate(late, t)  # whole trip past the horizon: no search
+    near = {**q, "depart_from": "2027-04-01", "depart_to": "2027-05-31"}
+    assert validate(near, t) is None and "_horizon" not in near
+    o = lambda price, minutes: {"price": price, "minutes": minutes}
+    assert faster([o(1000, 1200), o(1100, 900), o(1140, 840), o(1300, 600)]) == o(1140, 840)  # 1300 is > +15%
+    assert faster([o(1000, 1200), o(1100, 1150)]) is None  # saves under 2h
+    assert faster([o(1000, None), o(1010, 300)]) is None
+    f = lambda price, stops, minutes=600: {"price": price, "stops": stops, "minutes": minutes}
+    rows = [{"opts": [f(900, 2), f(1000, 1), f(1500, 0, 900)]}, {"opts": [f(800, 2, 3000), f(1400, 0)]}]
+    assert cheapest_with(rows, {"max_stops": 1}, 0)[1]["price"] == 1400  # stop limit ignored, cheapest nonstop
+    assert cheapest_with(rows, {"max_hours": 20}, 2)[1]["price"] == 900  # 800 is 50h, over the limit
+    assert cheapest_with(rows, {}, 3) is None
+    pairs = cross({"2027-04-01": "A", "2027-04-05": "B", "2027-04-09": None}, {"2027-04-20": "X", "2027-04-28": "Y"}, 15, 25)
+    assert pairs == {("2027-04-01", "2027-04-20"): ("A", "X"), ("2027-04-05", "2027-04-20"): ("B", "X"),
+                     ("2027-04-05", "2027-04-28"): ("B", "Y")}  # 01->28 is 27 days, 09 has no fare
     print("search selftest ok")
 
 

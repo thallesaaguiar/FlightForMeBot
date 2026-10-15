@@ -160,6 +160,7 @@ EXTRACT_PROMPT = """Today is {today}. Turn the user's flight request into JSON, 
  "destination_text": the exact words of THIS message that name the destination or region, or null,
  "destination_city": same as origin_city; when the destination is a country, its English name (e.g. "Japan"),
  "destination_code": same rule, "destination_airports": same rule,
+ "destination_also": other destination cities the user also accepts, in English (e.g. ["Osaka"]), or null,
  "depart_from": "YYYY-MM-DD", "depart_to": "YYYY-MM-DD": the window for the OUTBOUND flight only, never the return date
    (a month or month range covers whole months; a fixed outbound date means depart_from = depart_to;
    "from April onward" with no end means April 1 to the last day of May),
@@ -219,7 +220,13 @@ REGION_WORDS = [("america do sul", "south_america"), ("south america", "south_am
                 ("africa", "africa"), ("oceania", "oceania"), ("caribe", "north_america"), ("caribbean", "north_america"),
                 ("america central", "north_america"), ("america do norte", "north_america"),
                 ("north america", "north_america"), ("nacional", "domestic"), ("dentro do pais", "domestic"),
-                ("domestic", "domestic"), ("qualquer lugar", "anywhere"), ("anywhere", "anywhere")]
+                ("domestic", "domestic"), ("qualquer lugar", "anywhere"), ("anywhere", "anywhere"),
+                # last, so "sugira um destino na Europa" stays Europe
+                ("qualquer (destino|pais|canto)", "anywhere"), ("(pelo|o|no) mundo( todo| inteiro| afora)?", "anywhere"),
+                ("nao sei (pra|para) onde", "anywhere"), ("(sug[ei]r|sugest|indi[cq]|recomend)\\w*( de| me)? "
+                 "(um |uma |algum |alguma |alguns |algumas |uns |umas )?(destino|lugar|lugare|viage)\\w*", "anywhere"),
+                ("any (destination|place)", "anywhere"), ("somewhere", "anywhere"),
+                ("(suggest|recommend)\\w* (a |some )?(destination|place|trip)\\w*", "anywhere")]
 
 
 def named(q: dict, side: str, t: str) -> bool:
@@ -260,6 +267,15 @@ def _fill_from_text(q: dict, text: str, today: date):
                  and _norm(n).replace(" ", "") in squashed]
         found += [n for n in ("LATAM", "TAP") if re.search(rf"\b{n.lower()}\b", t)]
         q["airlines"] = found[:3] or None
+    # extra destinations count only when the message names them
+    # ponytail: matched on the English name, so "Quioto" for Kyoto is dropped; add name translations if it bites
+    also = [c for c in q.get("destination_also") or [] if isinstance(c, str) and len(c) >= 3 and _norm(c) in t]
+    if also and not q.get("destination_city"):  # gpt-oss puts "Tokyo or Osaka" all in destination_also
+        q.update(destination_city=also[0], destination_code=None, destination_airports=None)
+        also = also[1:]
+    q["destination_also"] = also or None
+    if also and re.search(r"volt\w*\s+(\w+\s+){0,3}(saindo|partindo|por|pel[oa]|de)\b|return\w* (from|via)|open.?jaw", t):
+        q["separate_tickets"] = True  # in to one city, back from another: only one-way legs can price it
     region = next((r for w, r in REGION_WORDS if re.search(rf"\b{w}\b", t)), None)
     if q.get("destination_region") and not region:
         q["destination_region"] = None  # a region the message never names is invented
