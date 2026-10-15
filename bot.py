@@ -31,6 +31,7 @@ DEEP = re.compile(r"data por data|dia a dia|dia por dia|todas as datas|todas as 
 MORE = re.compile(r"mais op|outras op|outras data|outras combina|mais combina|mais barat|outras busca|mais resultad"
                   r"|melhores (?:combina|op|data)|refa[cz]|de novo|novamente"
                   r"|more option|other date|cheaper|more result|best (?:combination|option|date)|redo|again")
+AGAIN = re.compile(r"\bdatas?\b|combina|\bop[cç]|\bdates?\b|option")  # only used when the request is unchanged
 LANG_CHOICES = [("🇧🇷 Português", "lang:pt"), ("🇬🇧 English", "lang:en")]
 
 
@@ -106,8 +107,8 @@ def send(chat_id: int, text: str, links: list[dict] | None = None, choices: list
         body = {"chat_id": chat_id, "text": chunk}
         if i == len(chunks) - 1 and (links or choices):
             rows = [[{"text": l["label"][:60], "url": l["url"]}] for l in (links or [])[:8]]
-            if choices:
-                rows.append([{"text": label, "callback_data": data} for label, data in choices])
+            rows += [[{"text": label, "callback_data": data} for label, data in choices[i:i + 3]]
+                     for i in range(0, len(choices or []), 3)]
             body["reply_markup"] = {"inline_keyboard": rows}
         r = httpx.post(f"{TG}/sendMessage", json=body, timeout=30).json()
         if not r.get("ok") and links and "reply_markup" in body:
@@ -156,12 +157,18 @@ def command(chat: int, name: str, text: str, level: str, lang: str | None) -> st
     return tr(lang, "Comando desconhecido. Mande /comandos para ver a lista.", "Unknown command. Send /comandos for the list.")
 
 
-def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | None):
-    """Guided search; inside a session the message refines the previous search. Non-admins have a monthly quota."""
+def out_of_quota(chat: int, admin: bool, lang: str | None) -> bool:
     used, limit = alerts.buscas_used(chat)
     if not admin and used >= limit:
         send(chat, tr(lang, f"Você já usou as {limit} buscas deste mês. Os alertas continuam funcionando (/alertas).",
                       f"You have used your {limit} searches this month. Alerts keep working (/alertas)."))
+        return True
+    return False
+
+
+def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | None):
+    """Guided search; inside a session the message refines the previous search. Non-admins have a monthly quota."""
+    if out_of_quota(chat, admin, lang):
         return
     try:
         q = llm.extract(text, s["q"])
@@ -174,6 +181,8 @@ def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | No
         deep = admin and bool(DEEP.search(search._norm(text)))  # 8 dates at once costs 8 searches: admins only
         more = deep or bool(MORE.search(search._norm(text)))  # "mais opções", "outras datas", "mais barato"
         same = lambda d: {k: v for k, v in (d or {}).items() if not k.startswith("_") and not k.endswith("_text") and k != "missing"}
+        if s["q"] and same(q) == same(s["q"]) and AGAIN.search(search._norm(text)):
+            more = True  # "faça novas combinações de datas", "ajuste as datas": nothing to change, so other dates
         if s["q"] and same(q) == same(s["q"]) and not more:
             alerts.log_miss(chat, text, "refinement changed nothing")
             send(chat, tr(lang, "Não entendi o que mudar nessa busca. Posso ajustar: datas ou mês, dias de viagem, escalas, "
@@ -183,41 +192,82 @@ def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | No
                           "maximum flight time (e.g. \"up to 19h per flight\"), budget, airline, origin, destination or "
                           "region. For other dates, send \"more options\". For a new search, use /buscar."))
             return
-        s["q"] = q
-        s.pop("hotel_ctx", None)  # a new flight search ends the hotel conversation
-        send(chat, tr(lang, "Buscando, aguarde um momento…", "Searching, one moment…"))
-        typing(chat)
-        tried = s.setdefault("tried", set())  # date pairs / destinations already checked live in this session
-        if not more:
-            tried.clear()
-        msg, links, checked = search.run(q, lang, frozenset(tried), search.DEEP if deep else search.LIVE)
-        tried.update(checked)
-        alerts.count_busca(chat, name)
-        send(chat, msg + tr(lang, "\n\nPode ajustar em texto (ex: \"e em junho?\", \"aceito 2 escalas\"). ",
-                            "\n\nYou can refine it in text (e.g. \"what about June?\", \"2 stops is fine\"). ")
-             + tr(lang, f"Interpretado por {q['_provider']}.", f"Read by {q['_provider']}."), links)
-        if q.get("_options") and not q.get("_explore"):
-            city = q.get("destination_city") or q.get("destination_code")
-            s["hid"] = s.get("hid", 0) + 1  # buttons of an older search must not use this search's dates
-            s["hotel"] = {"id": s["hid"], "city": city, "options": q["_options"], "adults": q.get("adults") or 1}
-            nums = "①②③"
-            rows = "\n".join(f"{nums[i]} {search._fmt(d)} → {search._fmt(r)}" for i, (d, r) in enumerate(q["_options"]))
-            send(chat, tr(lang, f"Quer que eu busque hotéis em {city}? Em quais datas?\n{rows}",
-                          f"Want me to look for hotels in {city}? Which dates?\n{rows}"),
-                 choices=[(tr(lang, f"🏨 Datas {nums[i]}", f"🏨 Dates {nums[i]}"), f"hotel:{i}:{s['hid']}")
-                          for i in range(len(q["_options"]))] + [(tr(lang, "Não", "No"), f"hotel:no:{s['hid']}")])
+        run_search(chat, name, s, q, lang, more, deep)
     except Exception as e:
         alerts.log_miss(chat, text, f"error: {type(e).__name__}: {e}")
         send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
 
 
+def run_search(chat: int, name: str, s: dict, q: dict, lang: str | None, more: bool = False, deep: bool = False):
+    """Run a validated search, send the results, then the hotel offer (one city) or destination buttons (open search)."""
+    s["q"] = q
+    s.pop("hotel_ctx", None)  # a new flight search ends the hotel conversation
+    send(chat, tr(lang, "Buscando, aguarde um momento…", "Searching, one moment…"))
+    typing(chat)
+    tried = s.setdefault("tried", set())  # date pairs / destinations already checked live in this session
+    if not more:
+        tried.clear()
+    msg, links, checked = search.run(q, lang, frozenset(tried), search.DEEP if deep else search.LIVE)
+    tried.update(checked)
+    alerts.count_busca(chat, name)
+    choices = None
+    if q.get("_dests"):  # open search: one button per suggested destination
+        s["hid"] = s.get("hid", 0) + 1
+        s["dests"] = {"id": s["hid"], "list": q["_dests"], "q": dict(q)}
+        choices = [(f"{i}. {city[:16]}", f"dest:{i - 1}:{s['hid']}") for i, (_, city) in enumerate(q["_dests"], 1)]
+    send(chat, msg + tr(lang, "\n\nPode ajustar em texto (ex: \"e em junho?\", \"aceito 2 escalas\"). ",
+                        "\n\nYou can refine it in text (e.g. \"what about June?\", \"2 stops is fine\"). ")
+         + tr(lang, f"Interpretado por {q['_provider']}.", f"Read by {q['_provider']}."), links, choices)
+    if q.get("_options") and not q.get("_explore"):
+        city = q.get("destination_city") or q.get("destination_code")
+        s["hid"] = s.get("hid", 0) + 1  # buttons of an older search must not use this search's dates
+        # several destination cities: each date pair offers hotels where that flight lands
+        cities = [c or city for c in q.get("_hotel_cities") or []] if q.get("_multi") else []
+        s["hotel"] = {"id": s["hid"], "city": city, "options": q["_options"], "adults": q.get("adults") or 1,
+                      "cities": cities}
+        nums = "①②③"
+        rows = "\n".join(f"{nums[i]} {search._fmt(d)} → {search._fmt(r)}" + (f" ({cities[i]})" if cities else "")
+                         for i, (d, r) in enumerate(q["_options"]))
+        where = "" if cities else tr(lang, f" em {city}", f" in {city}")
+        send(chat, tr(lang, f"Quer que eu busque hotéis{where}? Em quais datas?\n{rows}",
+                      f"Want me to look for hotels{where}? Which dates?\n{rows}"),
+             choices=[(tr(lang, f"🏨 Datas {nums[i]}", f"🏨 Dates {nums[i]}"), f"hotel:{i}:{s['hid']}")
+                      for i in range(len(q["_options"]))] + [(tr(lang, "Não", "No"), f"hotel:no:{s['hid']}")])
+
+
+def on_dest(chat: int, name: str, choice: str, hid: str):
+    """A suggested destination tapped: the full date search for it, same origin, dates and stay. Costs one search."""
+    if _stale(chat, "dests", hid, choice):
+        return
+    s, level = sessions[chat], level_of(chat)
+    lang = alerts.get_lang(chat) or "pt"
+    if level == "basic" or out_of_quota(chat, level == "admin", lang):
+        return
+    code, city = s["dests"]["list"][int(choice)]
+    q = {k: v for k, v in s["dests"]["q"].items() if not k.startswith("_") or k == "_provider"}
+    q.update(destination_city=city, destination_code=code, destination_airports=None, destination_text=city,
+             destination_region=None, destination_also=None)
+    try:
+        problem = search.validate(q, lang=lang)
+        if problem:
+            send(chat, problem)
+            return
+        run_search(chat, name, s, q, lang)
+    except Exception as e:
+        alerts.log_miss(chat, f"dest {code}", f"error: {type(e).__name__}: {e}")
+        send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
+
+
 def on_callback(cb: dict):
-    """Inline button presses; today only the language picker."""
+    """Inline button presses: language, hotel dates, flight redo and suggested destinations."""
     httpx.post(f"{TG}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=10)
     chat = (cb.get("message") or {}).get("chat", {}).get("id")
     data = cb.get("data") or ""
     if not chat or (chat not in ALLOWED and not OPEN_SIGNUP):
         return
+    if data.startswith("dest:"):
+        _, choice, hid = data.split(":")
+        return on_dest(chat, cb.get("from", {}).get("first_name", ""), choice, hid)
     if data.startswith(("hotel:", "flt:")):
         kind, choice, hid = (data + ":0").split(":")[:3]
         return (on_hotel if kind == "hotel" else on_flight_redo)(chat, choice, hid)
@@ -250,6 +300,7 @@ def on_hotel(chat: int, choice: str, hid: str):
     if choice == "no":
         return
     check_in, check_out = h["options"][int(choice)]
+    h["city"] = (h.get("cities") or [None] * 3)[int(choice)] or h["city"]
     send(chat, tr(lang, "Buscando hotéis, aguarde um momento…", "Looking for hotels, one moment…"))
     typing(chat)
     try:
@@ -320,6 +371,26 @@ def hotel_followup(chat: int, text: str, s: dict, lang: str | None) -> bool:
         alerts.log_miss(chat, text, f"error: {type(e).__name__}: {e}")
         send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
     return True
+
+
+MAX_STAYS = 5  # hotel stays per message, one paid search each
+
+
+def hotel_plan(chat: int, stays: list[dict], s: dict, lang: str | None):
+    """Hotels for stays written in the message ("17/05 até 19/05 perto da Disneyland, 21/05 a 25/05 em Osaka")."""
+    stays = stays[:MAX_STAYS]
+    adults = (s.get("q") or {}).get("adults") or 1
+    send(chat, tr(lang, f"Buscando hotéis para {len(stays)} estadia(s) ({len(stays)} buscas pagas), aguarde um momento…",
+                  f"Looking for hotels for {len(stays)} stay(s) ({len(stays)} paid searches), one moment…"))
+    for h in stays:
+        typing(chat)
+        try:
+            r = server.hotels(h["place"], h["in"], h["out"], adults, near=h["near"])
+            send(chat, *search.hotel_text(h["place"], r["picks"], h["in"], h["out"], lang))
+        except Exception as e:
+            alerts.log_miss(chat, f"hotel {h['place']}", f"error: {type(e).__name__}: {e}")
+            send(chat, tr(lang, f"Erro nos hotéis de {h['place']}", f"Error on hotels in {h['place']}")
+                 + f": {type(e).__name__}: {str(e)[:200]}")
 
 
 def on_flight_redo(chat: int, choice: str, hid: str):
@@ -431,6 +502,8 @@ def main():
             typing(chat)
             if s["mode"] == "agente" and admin:
                 send(chat, *llm.ask(chat, text))
+            elif HOTEL_Q.search(search._norm(text)) and (stays := search.hotel_requests(text)):
+                hotel_plan(chat, stays, s, lang)
             elif s.get("hotel_ctx") and hotel_followup(chat, text, s, lang):
                 pass
             else:
