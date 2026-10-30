@@ -16,7 +16,9 @@ Searching
 - Follow-up messages refine the last search: "what about June?", "2 stops is fine", "only 10 days", "up to 19h per flight", "under R$ 3,600".
 - "More options" or "other dates" checks dates not checked yet in the session. "Day by day" (admins) checks 8 at once.
 - Departure windows of up to about 6 months ("April to September"). Without dates, it searches the next 3 months and says so.
-- Several destination cities: "Tokyo or Osaka" searches every airport of both in the same live search. "In to Tokyo, back from Osaka" turns on separate tickets, so crossing the one-way legs prices the open jaw, and the airports flown are shown on each line.
+- Several destination cities: "Tokyo or Osaka" searches every airport of both in the same live search. "Tokyo, or in to Tokyo and back from Osaka" turns on separate tickets, so crossing the one-way legs finds the cheapest mix, and the airports flown are shown on each line.
+- Fixed open jaw: "chegar por Xangai e voltar por Tóquio" flies in to one city and back from the other only (one-way legs, 4 paid searches). The return city is read from the text after "volta"/"voltar por", not by the model; "pode ser", "ou" or "também" make it either city instead.
+- City names in Portuguese (Xangai, Cidade do Cabo, Quioto) come from the Travelpayouts Portuguese list, downloaded once next to the English one.
 - Google Flights only lists flights about 330 days ahead (airline sites sell a bit further). The departure window is cut where the return still fits; a trip entirely past it gets an /alerta suggestion instead of paid searches that would come back empty.
 - Open destinations and trip ideas: "from Madrid, 10 days anywhere in November", "me sugere um lugar", "pelo mundo", or a region ("anywhere in Europe") or a country ("to Japan"). The bot lists up to 10 destinations from the free cache in three groups: cheapest, furthest for the money (lowest price per km over 3,000 km) and nonstop, with at most 2 per country and no trip that spends over 20% of the stay in the air. The first of each group is confirmed live (3 paid searches), and each destination has a button that runs the full date search for it.
 - Separate tickets: prices one-way tickets next to the round trip and crosses every outbound with every return that fits the stay, so 2 outbound + 2 return searches can price up to 4 date pairs, some never searched as a round trip.
@@ -26,6 +28,16 @@ Searching
 - Booking buttons open the airline or agency page directly.
 - Two live sources at once: with `FLIGHTPOWERS_KEY` set, every live search asks SerpApi and FlightPowers in parallel and merges the answers, one row per itinerary at the lower price. If one source fails or runs out of quota, the other keeps working.
 - "Searching, one moment…" is sent as soon as the request is understood, before the slow part.
+
+Is it a good deal?
+
+- Each search scores option 1 from 1 to 10 against Google's price history for those dates (how often it was cheaper in the last ~60 days, the usual range, the last week's trend) and says BOOK NOW, WAIT (with a ready /alerta) or CHANGE PLANS. Free: it comes with the live search.
+- Low-cost carriers are flagged (bags and seats extra), from the Travelpayouts airline list.
+- Free hints from the cache under the results: the priciest departure days to avoid, a cheaper airport within 250 km of the origin or destination, and a self-transfer through a hub when it looks 15%+ cheaper.
+- "Conexão por conta própria" / "self-transfer" checks option 1's dates live as two tickets through the best hub (about 4 paid searches each way), with the risks spelled out.
+- "Cidade oculta" / "hidden city" looks for one-way tickets to a city past the destination that stop there and cost less (2 paid searches), with the risks: one-way only, carry-on only, against most airlines' rules.
+- "Custo total" adds up the flight and the hotels searched in the chat and lists where to save.
+- "Onde ficar em Tóquio?" answers with 3 neighborhoods from the model's own knowledge, marked as AI tips without live data.
 
 Hotels
 
@@ -256,7 +268,7 @@ Booking links are 3,000 to 6,500 characters long. The bot sends them as Telegram
 
 ## Local model quality
 
-`extract_eval.py` scores how requests are read on 26 fixed cases: new searches, refinements, regions, a country, budgets and real conversations that went wrong. It runs free on Ollama in about 3 minutes:
+`extract_eval.py` scores how requests are read on 33 fixed cases: new searches, refinements, regions, a country, budgets and real conversations that went wrong. It runs free on Ollama in about 3 minutes:
 
 ```bash
 LLM=ollama uv run --with "mcp>=1.2,<2" --with httpx --with "anthropic>=1,<2" --with "openai>=3,<4" python extract_eval.py

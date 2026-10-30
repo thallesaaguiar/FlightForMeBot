@@ -234,7 +234,9 @@ def named(q: dict, side: str, t: str) -> bool:
     said = str(q.get(f"{side}_text") or "")
     if len(said) >= 3 and not re.search(r"\d", said) and _norm(said) in t:  # "fico só 10 dias" is not a place
         return True
-    return any(len(x) >= 3 and _norm(x) in t for x in (str(q.get(f"{side}_{k}") or "") for k in ("city", "code")))
+    import search  # lazy, see real_place
+    return (any(len(x) >= 3 and _norm(x) in t for x in (str(q.get(f"{side}_{k}") or "") for k in ("city", "code")))
+            or search.mentioned(q.get(f"{side}_city"), t))  # "Shanghai" said as "Xangai"
 
 
 def real_place(q: dict, side: str) -> bool:
@@ -243,6 +245,34 @@ def real_place(q: dict, side: str) -> bool:
     name = q.get(f"{side}_city")
     return bool(search.resolve(name, q.get(f"{side}_code"), q.get(f"{side}_airports"))
                 or (side == "destination" and name and search._norm(str(name)) in search.countries()[0]))
+
+
+def _return_city(t: str, q: dict) -> str | None:
+    """A city named right after "volta"/"voltar por"/"back from" that isn't the destination
+    ("a volta Tokyo no Japão para Madrid" -> Tokyo). "ida e volta" and "volta para X" name no return city."""
+    import search  # lazy, see real_place
+    skip = (search.resolve(q.get("destination_city"), q.get("destination_code"), None) or ("",))[0]
+    for m in re.finditer(r"(?<!ida e )\b(?:volt|regress|return|back\b)\w*((?:\W+\w+){1,4})", t):
+        words = []
+        for w in re.findall(r"\w+", m.group(1)):
+            if w in ("para", "pra", "to"):
+                break  # where the return goes, not where it leaves from
+            if len(w) >= 3 and w not in RETURN_STOPWORDS:
+                words.append(w)
+        for name in [" ".join(words[i:i + 2]) for i in range(len(words) - 1)] + words:
+            place = search.resolve(name, None, None)
+            if place and place[0] != skip:
+                return name
+    return None
+
+
+def _same_city(a, b) -> bool:
+    import search  # lazy, see real_place
+    ra, rb = search.resolve(a, None, None), search.resolve(b, None, None)
+    return bool(ra and rb and ra[0] == rb[0])
+
+
+RETURN_STOPWORDS ={"por", "pelo", "pela", "para", "pra", "saindo", "partindo", "from", "via", "the", "home", "casa"}
 
 
 def _fill_from_text(q: dict, text: str, today: date):
@@ -267,12 +297,22 @@ def _fill_from_text(q: dict, text: str, today: date):
                  and _norm(n).replace(" ", "") in squashed]
         found += [n for n in ("LATAM", "TAP") if re.search(rf"\b{n.lower()}\b", t)]
         q["airlines"] = found[:3] or None
-    # extra destinations count only when the message names them
-    # ponytail: matched on the English name, so "Quioto" for Kyoto is dropped; add name translations if it bites
-    also = [c for c in q.get("destination_also") or [] if isinstance(c, str) and len(c) >= 3 and _norm(c) in t]
+    # extra destinations count only when the message names them, in English or Portuguese ("Cidade do Cabo")
+    import search  # lazy, see real_place
+    also = [c for c in q.get("destination_also") or [] if isinstance(c, str) and len(c) >= 3
+            and (_norm(c) in t or search.mentioned(c, t))][:3]
     if also and not q.get("destination_city"):  # gpt-oss puts "Tokyo or Osaka" all in destination_also
         q.update(destination_city=also[0], destination_code=None, destination_airports=None)
         also = also[1:]
+    # open jaw: in to one city, back from a named other one. Read from the text only: a return_from field in the
+    # prompt made gpt-oss lose the origin elsewhere. "pode ser"/"ou" means either city, so it stays in also
+    back = _return_city(t, q)  # None in a refinement that doesn't name one: the earlier one is kept
+    if back and re.search(r"\bpode ser\b|\bou\b|\bambas\b|\btambem\b|\beither\b|\bor\b|\balso\b", t):
+        also, back = also + [back], None
+    if back:
+        also = [c for c in also if _norm(c) != _norm(back)]
+        q["separate_tickets"] = True
+    q["return_from"] = back
     q["destination_also"] = also or None
     if also and re.search(r"volt\w*\s+(\w+\s+){0,3}(saindo|partindo|por|pel[oa]|de)\b|return\w* (from|via)|open.?jaw", t):
         q["separate_tickets"] = True  # in to one city, back from another: only one-way legs can price it
@@ -331,6 +371,9 @@ def extract(text: str, current: dict | None = None, today: date | None = None) -
             q = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
             _fill_from_text(q, text, today or date.today())
             if current:
+                if q.get("return_from") and _same_city(q.get("origin_city"), q["return_from"]):
+                    for f in ("text", "city", "code", "airports"):  # gpt-oss read "voltar por Tokyo" as the origin
+                        q[f"origin_{f}"] = current.get(f"origin_{f}")
                 # small models drop fields while refining ("e saindo de Lisboa?" came back without a destination),
                 # and a half-filled draft must keep what earlier answers already said
                 moved = {side for side in ("origin", "destination")
@@ -366,6 +409,33 @@ def extract(text: str, current: dict | None = None, today: date | None = None) -
         except Exception as e:
             errors.append(f"{p}: {type(e).__name__}: {str(e)[:120]}")
     raise RuntimeError("não consegui interpretar o pedido:\n" + "\n".join(errors))
+
+
+ADVICE_PROMPT = """The user asks where to stay in a city. Recommend the 3 best neighborhoods for their travel style and
+budget (assume a first-time visitor when unsaid; ask nothing). For each: why it fits, transport access, safety and one
+downside, in 2-3 short lines. Plain text, no Markdown, in the user's language. If you don't know the city well, say so
+instead of guessing."""
+
+
+def advise(text: str) -> tuple[str, str]:
+    """(answer, provider) for where-to-stay questions. Model knowledge only: no live data behind it."""
+    errors = []
+    for p in EXTRACT_ORDER:
+        try:
+            if p == "claude":
+                r = _clients[p].messages.create(model=PROVIDERS[p][2], max_tokens=4000, system=ADVICE_PROMPT,
+                                                messages=[{"role": "user", "content": text}])
+                answer = "".join(b.text for b in r.content if b.type == "text")
+            else:
+                effort = {"reasoning_effort": EXTRACT_EFFORT} if p == "ollama" and EXTRACT_EFFORT else {}
+                r = _clients[p].chat.completions.create(model=PROVIDERS[p][2], temperature=0.3, **effort, messages=[
+                    {"role": "system", "content": ADVICE_PROMPT}, {"role": "user", "content": text}])
+                answer = r.choices[0].message.content or ""
+            if answer.strip():
+                return plain(answer), p
+        except Exception as e:
+            errors.append(f"{p}: {type(e).__name__}: {str(e)[:120]}")
+    raise RuntimeError("nenhuma IA respondeu:\n" + "\n".join(errors))
 
 
 def reset(chat: int):

@@ -10,6 +10,7 @@ from datetime import date, timedelta
 
 import httpx
 
+import advice
 import alerts
 import llm
 import search
@@ -32,6 +33,12 @@ MORE = re.compile(r"mais op|outras op|outras data|outras combina|mais combina|ma
                   r"|melhores (?:combina|op|data)|refa[cz]|de novo|novamente"
                   r"|more option|other date|cheaper|more result|best (?:combination|option|date)|redo|again")
 AGAIN = re.compile(r"\bdatas?\b|combina|\bop[cç]|\bdates?\b|option")  # only used when the request is unchanged
+# trip advice asked in plain text; each regex runs on the accent-free lower-case message
+TRANSFER = re.compile(r"conta propria|self.?transfer|conex\w* separad|escala separad")
+HIDDEN = re.compile(r"cidade oculta|hidden.?city|skiplag|descer na escala")
+TOTAL = re.compile(r"custo total|total da viagem|quanto (vai )?(custa|custar|fica|sai)r? (a viagem|tudo)|trip cost|total cost")
+STAY_AREA = re.compile(r"\bbairros?\b|onde (ficar|me hosped|se hosped|hosped)|melhor(es)? (regi|area|zona)\w* (pra|para) "
+                       r"(ficar|hosped)|where to stay|neighbo")
 LANG_CHOICES = [("🇧🇷 Português", "lang:pt"), ("🇬🇧 English", "lang:en")]
 
 
@@ -193,6 +200,7 @@ def buscar(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | No
                           "region. For other dates, send \"more options\". For a new search, use /buscar."))
             return
         run_search(chat, name, s, q, lang, more, deep)
+        trip_advice(chat, name, text, s, admin, lang, searched=True)
     except Exception as e:
         alerts.log_miss(chat, text, f"error: {type(e).__name__}: {e}")
         send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
@@ -210,6 +218,8 @@ def run_search(chat: int, name: str, s: dict, q: dict, lang: str | None, more: b
     msg, links, checked = search.run(q, lang, frozenset(tried), search.DEEP if deep else search.LIVE)
     tried.update(checked)
     alerts.count_busca(chat, name)
+    if q.get("_best"):  # for the trip total
+        s.setdefault("trip", {})["flight"] = {**q["_best"], "adults": q.get("adults") or 1, "savings": q.get("_savings") or []}
     choices = None
     if q.get("_dests"):  # open search: one button per suggested destination
         s["hid"] = s.get("hid", 0) + 1
@@ -233,6 +243,41 @@ def run_search(chat: int, name: str, s: dict, q: dict, lang: str | None, more: b
                       f"Want me to look for hotels{where}? Which dates?\n{rows}"),
              choices=[(tr(lang, f"🏨 Datas {nums[i]}", f"🏨 Dates {nums[i]}"), f"hotel:{i}:{s['hid']}")
                       for i in range(len(q["_options"]))] + [(tr(lang, "Não", "No"), f"hotel:no:{s['hid']}")])
+
+
+def trip_advice(chat: int, name: str, text: str, s: dict, admin: bool, lang: str | None, searched: bool = False) -> bool:
+    """Self-transfer, hidden city, trip total or where-to-stay asked in the message. False = none of them.
+    searched: the message was also a flight search just answered, so only the paid checks can still apply."""
+    t = search._norm(text)
+    paid = [(TRANSFER, advice.self_transfer), (HIDDEN, advice.hidden_city)]
+    asked = [f for rx, f in paid if rx.search(t)]
+    if asked:
+        if out_of_quota(chat, admin, lang):
+            return True
+        send(chat, tr(lang, "Conferindo ao vivo, aguarde um momento…", "Checking live, one moment…"))
+        for f in asked:
+            typing(chat)
+            try:
+                send(chat, f(s.get("q"), lang))
+            except Exception as e:
+                alerts.log_miss(chat, text, f"error: {type(e).__name__}: {e}")
+                send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
+        alerts.count_busca(chat, name)
+        return True
+    if searched:
+        return False
+    if TOTAL.search(t):
+        send(chat, advice.trip_total(s, lang))
+        return True
+    if STAY_AREA.search(t):
+        try:
+            answer, provider = llm.advise(text)
+            send(chat, answer + tr(lang, f"\n\nDicas geradas por IA ({provider}), sem dados ao vivo: confira antes de reservar.",
+                                   f"\n\nAI-generated tips ({provider}), no live data: check before booking."))
+        except Exception as e:
+            send(chat, tr(lang, "Erro", "Error") + f": {type(e).__name__}: {str(e)[:300]}")
+        return True
+    return False
 
 
 def on_dest(chat: int, name: str, choice: str, hid: str):
@@ -305,6 +350,7 @@ def on_hotel(chat: int, choice: str, hid: str):
     typing(chat)
     try:
         r = server.hotels(h["city"], check_in, check_out, h["adults"])
+        advice.record_hotel(s, h["city"], check_in, check_out, r["picks"])
         s["hotel_ctx"] = {"id": h["id"], "city": h["city"], "in": check_in, "out": check_out, "adults": h["adults"],
                           "shown": {p["name"] for p in r["picks"]}}
         text, links = search.hotel_text(h["city"], r["picks"], check_in, check_out, lang)
@@ -386,6 +432,7 @@ def hotel_plan(chat: int, stays: list[dict], s: dict, lang: str | None):
         typing(chat)
         try:
             r = server.hotels(h["place"], h["in"], h["out"], adults, near=h["near"])
+            advice.record_hotel(s, h["place"], h["in"], h["out"], r["picks"])
             send(chat, *search.hotel_text(h["place"], r["picks"], h["in"], h["out"], lang))
         except Exception as e:
             alerts.log_miss(chat, f"hotel {h['place']}", f"error: {type(e).__name__}: {e}")
@@ -504,6 +551,10 @@ def main():
                 send(chat, *llm.ask(chat, text))
             elif HOTEL_Q.search(search._norm(text)) and (stays := search.hotel_requests(text)):
                 hotel_plan(chat, stays, s, lang)
+            elif (s.get("q") or {}).get("_best") and trip_advice(chat, name, text, s, admin, lang):
+                pass
+            elif TOTAL.search(search._norm(text)) or STAY_AREA.search(search._norm(text)):
+                trip_advice(chat, name, text, s, admin, lang)
             elif s.get("hotel_ctx") and hotel_followup(chat, text, s, lang):
                 pass
             else:

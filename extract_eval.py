@@ -95,6 +95,20 @@ CASES = [
     ("faça buscas indo e voltando por Osaka tambem", MADRID,
      {"origin_code": "MAD", "destination_code": "TYO", "separate_tickets": True,
       "destination_airports": lambda v: "KIX" in str(v) and "NRT" in str(v), "depart_from": "2027-04-01"}),
+    ("Faça uma busca de passagem saindo de Madrid para Joanesburgo ou Cidade do cabo. Pode ser indo por um aeroporto e "
+     "voltando por outro tbm. Pesquise a partir de Abril de 2027, ficando de 15 a 20 dias",
+     None, {"origin_code": "MAD", "destination_code": "JNB", "separate_tickets": True, "depart_from": "2027-04-01",
+            "depart_to": "2027-05-31", "min_days": 15, "destination_airports": lambda v: "CPT" in str(v)}),
+    # strict open jaw: in to one city, back from another (2026-10-30, the return city was dropped)
+    ("Quero que você faça uma busca de passagens saindo de MADRID para Xangai na China na ida e a volta Tokyo no Japão "
+     "para MADRID. Viagem de pelo menos 20 dias. Faça buscas a partir de Maio de 2027",
+     None, {"origin_code": "MAD", "destination_code": lambda v: v in ("SHA", "PVG"), "_return_code": "TYO",
+            "separate_tickets": True, "depart_from": "2027-05-01", "min_days": 20}),
+    ("Acho que você não entendeu, quero chegar por Xangai e voltar por Tokyo",
+     {**MADRID, "destination_code": "SHA", "destination_airports": "PVG,SHA", "destination_city": "Shanghai",
+      "depart_from": "2027-05-01", "depart_to": "2027-06-30", "min_days": 20},
+     {"origin_code": "MAD", "destination_code": lambda v: v in ("SHA", "PVG"), "_return_code": "TYO",
+      "_return_airports": "HND,NRT", "depart_from": "2027-05-01"}),
     # trip ideas: no destination, the bot suggests
     ("quero viajar 10 dias saindo de Madrid para qualquer destino em novembro",
      None, {"origin_code": "MAD", "destination_region": "anywhere", "_explore": True, "depart_from": "2026-11-01",
