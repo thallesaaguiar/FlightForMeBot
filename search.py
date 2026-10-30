@@ -292,9 +292,9 @@ def validate(q: dict, today: date | None = None, lang: str | None = None) -> str
     d0 = max(d0, tomorrow)
     if d1 < d0:
         return tr(lang, "As datas de ida já passaram ou estão invertidas.", "The departure dates are in the past or reversed.")
-    if (d1 - d0).days > MAX_WINDOW:
-        return tr(lang, f"O período de ida pode ter no máximo {MAX_WINDOW} dias (uns 6 meses).",
-                  f"The departure period can be at most {MAX_WINDOW} days (about 6 months).")
+    q.pop("_window_cut", None)
+    if (d1 - d0).days > MAX_WINDOW:  # "maio a novembro": search the first 6 months instead of refusing
+        d1, q["_window_cut"] = d0 + timedelta(days=MAX_WINDOW), True
     q["depart_from"], q["depart_to"] = d0.isoformat(), d1.isoformat()
     if q.get("round_trip"):
         try:
@@ -339,7 +339,10 @@ def horizon_cut(q: dict, today: date, lang: str | None) -> str | None:
 
 def horizon_note(q: dict, lang: str | None) -> str:
     if not q.get("_horizon"):
-        return ""
+        return tr(lang, f"\nA ida pode cobrir no máximo {MAX_WINDOW} dias, então busquei até {_fmt(q['depart_to'])}. "
+                        "Para depois disso, peça uma nova busca a partir dessa data.",
+                  f"\nThe departure period covers at most {MAX_WINDOW} days, so I searched up to "
+                  f"{_fmt(q['depart_to'])}. For later, ask again from that date.") if q.get("_window_cut") else ""
     h = _fmt(q["_horizon"])
     return tr(lang, f"\nO Google Flights só mostra voos até {h}, então a ida ficou até {_fmt(q['depart_to'])}. "
                     "Para datas depois disso, crie um /alerta.",
@@ -1128,6 +1131,11 @@ def selftest():
     assert "/alerta MAD TYO 01/09-09/11 20-30d" in validate(late, t)  # whole trip past the horizon: no search
     near = {**q, "depart_from": "2027-04-01", "depart_to": "2027-05-31"}
     assert validate(near, t) is None and "_horizon" not in near
+    may_nov = {**q, "depart_from": "2027-05-01", "depart_to": "2027-11-30", "min_days": 20, "max_days": 30}
+    assert validate(may_nov, date(2026, 10, 30)) is None and may_nov["_horizon"]  # cut, not refused
+    wide = {**q, "depart_from": "2026-10-01", "depart_to": "2027-06-30"}
+    assert validate(wide, t) is None and wide["_window_cut"] and wide["depart_to"] == "2027-04-09"
+    assert "09/04" in horizon_note(wide, "pt")
     o = lambda price, minutes: {"price": price, "minutes": minutes}
     assert faster([o(1000, 1200), o(1100, 900), o(1140, 840), o(1300, 600)]) == o(1140, 840)  # 1300 is > +15%
     assert faster([o(1000, 1200), o(1100, 1150)]) is None  # saves under 2h

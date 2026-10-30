@@ -15,7 +15,7 @@ Searching
 - Plain messages start a guided search. The bot picks the most promising dates from the free cache, checks 3 of them live and lists the 2 cheapest date pairs. Below them come the cheapest nonstop on any date checked (if there is one) and a 2-stop flight when it beats option 1, with the difference. Both come from the same searches, at no extra cost.
 - Follow-up messages refine the last search: "what about June?", "2 stops is fine", "only 10 days", "up to 19h per flight", "under R$ 3,600".
 - "More options" or "other dates" checks dates not checked yet in the session. "Day by day" (admins) checks 8 at once.
-- Departure windows of up to about 6 months ("April to September"). Without dates, it searches the next 3 months and says so.
+- Departure windows of up to about 6 months ("April to September"); a longer one is cut to 6 months with a note, not refused. Without dates, it searches the next 3 months and says so.
 - Several destination cities: "Tokyo or Osaka" searches every airport of both in the same live search. "Tokyo, or in to Tokyo and back from Osaka" turns on separate tickets, so crossing the one-way legs finds the cheapest mix, and the airports flown are shown on each line.
 - Fixed open jaw: "chegar por Xangai e voltar por Tóquio" flies in to one city and back from the other only (one-way legs, 4 paid searches). The return city is read from the text after "volta"/"voltar por", not by the model; "pode ser", "ou" or "também" make it either city instead.
 - City names in Portuguese (Xangai, Cidade do Cabo, Quioto) come from the Travelpayouts Portuguese list, downloaded once next to the English one.
