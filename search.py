@@ -865,9 +865,12 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
         first = lambda r: next((o for o in r["options"] if fits(o, q)), None)
         outs = {d: first(r) for d, r in zip(deps, res[len(rts):])}
         backs = {d: first(r) for d, r in zip(rets, res[len(rts) + len(deps):])}
+        urls = {("out", d): r.get("google_flights_url") for d, r in zip(deps, res[len(rts):])}
+        urls |= {("back", d): r.get("google_flights_url") for d, r in zip(rets, res[len(rts) + len(deps):])}
         for (dep, ret), pair in cross(outs, backs, q["min_days"], q["max_days"]).items():
-            rows.setdefault((dep, ret), {"dep": dep, "ret": ret, "ok": None, "fast": None, "opts": [], "pref": None,
-                                         "url": None, "insights": None})["split"] = pair
+            row = rows.setdefault((dep, ret), {"dep": dep, "ret": ret, "ok": None, "fast": None, "opts": [],
+                                               "pref": None, "url": None, "insights": None})
+            row["split"], row["legs"] = pair, (urls[("out", dep)], urls[("back", ret)])
     results = list(rows.values())
     used = server._month_calls() - before
 
@@ -969,8 +972,14 @@ def run(q: dict, lang: str | None = None, exclude=frozenset(), n: int = LIVE) ->
                    "\nYou gave no dates, so I searched departures in the next 3 months. Name a period to refine "
                    "(e.g. \"in April\").")
     tail += tr(lang, "\nPara ver outras datas, mande \"mais opções\".", "\nFor other dates, send \"more options\".")
-    links = [{"label": f"Google Flights {_fmt(x['dep'])}" + (f"→{_fmt(x['ret'])}" if x["ret"] else ""), "url": x["url"]}
-             for x in found if x["url"]]
+    links = []
+    for x in found:
+        if x["url"]:
+            links.append({"label": f"Google Flights {_fmt(x['dep'])}" + (f"→{_fmt(x['ret'])}" if x["ret"] else ""),
+                          "url": x["url"]})
+        elif x.get("legs"):  # only priced as two one-way tickets: one link per leg
+            links += [{"label": tr(lang, f"{w} {_fmt(d)}", f"{e} {_fmt(d)}"), "url": u}
+                      for (w, e, d), u in zip((("Ida", "Out", x["dep"]), ("Volta", "Back", x["ret"])), x["legs"]) if u]
     return "\n".join([head, "", *lines, tail]), links, [key(dep, ret) for dep, ret in picks]
 
 
